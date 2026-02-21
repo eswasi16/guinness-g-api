@@ -228,4 +228,5 @@ def get_profile(username: str):
 
     if not profile:
         conn.close()
-        return {"e
+        return {"error": "some message"}
+
