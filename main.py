@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 from datetime import datetime
+import httpx
 
 load_dotenv()
 
@@ -45,7 +46,17 @@ def init_db():
         CREATE TABLE IF NOT EXISTS profiles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            push_token TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS friends (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            follower TEXT NOT NULL,
+            following TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(follower, following)
         )
     """)
     for col in ["bar_name TEXT", "bar_rating INTEGER", "fresh_photo_uri TEXT"]:
@@ -53,6 +64,10 @@ def init_db():
             conn.execute(f"ALTER TABLE scores ADD COLUMN {col}")
         except:
             pass
+    try:
+        conn.execute("ALTER TABLE profiles ADD COLUMN push_token TEXT")
+    except:
+        pass
     conn.commit()
     conn.close()
 
@@ -103,7 +118,6 @@ def root():
 async def analyze(file: UploadFile = File(...)):
     image_bytes = await file.read()
     img_b64 = base64.b64encode(image_bytes).decode()
-
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[{
@@ -139,8 +153,57 @@ async def save_score(payload: dict):
          bar_rating, fresh_photo_uri, datetime.now().isoformat())
     )
     conn.commit()
-    conn.close()
+
+    # Notify followers if 4+ stars
+    if bar_rating and bar_rating >= 4:
+        followers = conn.execute(
+            "SELECT follower FROM friends WHERE following=?", (username,)
+        ).fetchall()
+        tokens = []
+        for f in followers:
+            row = conn.execute(
+                "SELECT push_token FROM profiles WHERE username=?", (f["follower"],)
+            ).fetchone()
+            if row and row["push_token"]:
+                tokens.append(row["push_token"])
+        conn.close()
+        if tokens:
+            await send_push_notifications(
+                tokens,
+                title="New pour from " + username,
+                body=f"{username} just rated a {bar_rating}-star pint at {bar_name}!"
+            )
+    else:
+        conn.close()
+
     return {"status": "saved"}
+
+# --- Push Notifications ---
+async def send_push_notifications(tokens: list, title: str, body: str):
+    messages = [
+        {"to": token, "title": title, "body": body, "sound": "default"}
+        for token in tokens
+    ]
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            "https://exp.host/--/api/v2/push/send",
+            json=messages,
+            headers={"Content-Type": "application/json"}
+        )
+
+# --- Register Push Token ---
+@app.post("/profile/{username}/push-token")
+async def register_push_token(username: str, payload: dict):
+    token = payload.get("token")
+    if not token:
+        return {"error": "Token required"}
+    conn = get_db()
+    conn.execute(
+        "UPDATE profiles SET push_token=? WHERE username=?", (token, username)
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "token saved"}
 
 # --- Leaderboard ---
 @app.get("/leaderboard")
@@ -181,6 +244,20 @@ def get_bars():
     conn.close()
     return [dict(row) for row in rows]
 
+@app.get("/bars/search")
+def search_bars(q: str = ""):
+    if not q:
+        return []
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT DISTINCT bar_name FROM scores
+        WHERE bar_name LIKE ? AND bar_name != 'Unknown Bar'
+        ORDER BY bar_name ASC
+        LIMIT 8
+    """, (f"%{q}%",)).fetchall()
+    conn.close()
+    return [row["bar_name"] for row in rows]
+
 @app.get("/bars/{bar_name}")
 def get_bar_detail(bar_name: str):
     conn = get_db()
@@ -198,17 +275,14 @@ async def create_profile(payload: dict):
     username = payload.get("username", "").strip()
     if not username:
         return {"error": "Username is required"}
-
     conn = get_db()
     existing = conn.execute(
         "SELECT * FROM profiles WHERE username=?", (username,)
     ).fetchone()
-
     if existing:
         conn.close()
         return {"status": "exists", "username": username,
                 "message": f"Welcome back, {username}!"}
-
     conn.execute(
         "INSERT INTO profiles (username, created_at) VALUES (?,?)",
         (username, datetime.now().isoformat())
@@ -225,8 +299,124 @@ def get_profile(username: str):
     profile = conn.execute(
         "SELECT * FROM profiles WHERE username=?", (username,)
     ).fetchone()
-
     if not profile:
         conn.close()
-        return {"error": "some message"}
+        return {"error": "Profile not found"}
+    stats = conn.execute("""
+        SELECT
+            COUNT(*) as total_pours,
+            ROUND(AVG(distance_cm), 2) as avg_cm,
+            MAX(bar_rating) as best_rating,
+            MIN(bar_rating) as worst_rating
+        FROM scores WHERE username=?
+    """, (username,)).fetchone()
+    conn.close()
+    return {
+        "username": username,
+        "created_at": profile["created_at"],
+        "total_pours": stats["total_pours"],
+        "avg_cm": stats["avg_cm"],
+        "best_rating": stats["best_rating"],
+        "worst_rating": stats["worst_rating"]
+    }
 
+# --- Get Profile Pours ---
+@app.get("/profile/{username}/pours")
+def get_profile_pours(username: str):
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT distance_cm, bar_name, bar_rating, fresh_photo_uri, timestamp
+        FROM scores WHERE username=?
+        ORDER BY bar_rating DESC, distance_cm ASC
+    """, (username,)).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+# --- Friends ---
+@app.post("/friends/follow")
+async def follow(payload: dict):
+    follower = payload.get("follower", "").strip()
+    following = payload.get("following", "").strip()
+    if not follower or not following:
+        return {"error": "Both follower and following are required"}
+    if follower == following:
+        return {"error": "You cannot follow yourself"}
+    conn = get_db()
+    target = conn.execute(
+        "SELECT username FROM profiles WHERE username=?", (following,)
+    ).fetchone()
+    if not target:
+        conn.close()
+        return {"error": "User not found"}
+    try:
+        conn.execute(
+            "INSERT INTO friends (follower, following, created_at) VALUES (?,?,?)",
+            (follower, following, datetime.now().isoformat())
+        )
+        conn.commit()
+    except:
+        conn.close()
+        return {"status": "already_following"}
+    conn.close()
+    return {"status": "followed"}
+
+@app.post("/friends/unfollow")
+async def unfollow(payload: dict):
+    follower = payload.get("follower", "").strip()
+    following = payload.get("following", "").strip()
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM friends WHERE follower=? AND following=?", (follower, following)
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "unfollowed"}
+
+@app.get("/friends/{username}")
+def get_friends(username: str):
+    conn = get_db()
+    following = conn.execute(
+        "SELECT following FROM friends WHERE follower=?", (username,)
+    ).fetchall()
+    followers = conn.execute(
+        "SELECT follower FROM friends WHERE following=?", (username,)
+    ).fetchall()
+    conn.close()
+    return {
+        "following": [r["following"] for r in following],
+        "followers": [r["follower"] for r in followers]
+    }
+
+@app.get("/friends/{username}/feed")
+def get_friend_feed(username: str):
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT s.username, s.distance_cm, s.bar_name, s.bar_rating,
+               s.fresh_photo_uri, s.description, s.timestamp
+        FROM scores s
+        JOIN friends f ON s.username = f.following
+        WHERE f.follower = ?
+        ORDER BY s.timestamp DESC
+        LIMIT 50
+    """, (username,)).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+@app.get("/friends/{username}/search")
+def search_users(username: str, q: str = ""):
+    if not q:
+        return []
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT p.username,
+               EXISTS(
+                   SELECT 1 FROM friends
+                   WHERE follower=? AND following=p.username
+               ) as is_following
+        FROM profiles p
+        WHERE p.username LIKE ? AND p.username != ?
+        ORDER BY p.username ASC
+        LIMIT 10
+    """, (username, f"%{q}%", username)).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
