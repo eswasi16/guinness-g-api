@@ -178,6 +178,18 @@ async def save_score(payload: dict):
 
     return {"status": "saved"}
 
+# --- Delete Score ---
+@app.delete("/scores/{score_id}")
+async def delete_score(score_id: int, payload: dict):
+    username = payload.get("username")
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM scores WHERE id=? AND username=?", (score_id, username)
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "deleted"}
+
 # --- Push Notifications ---
 async def send_push_notifications(tokens: list, title: str, body: str):
     messages = [
@@ -325,7 +337,7 @@ def get_profile(username: str):
 def get_profile_pours(username: str):
     conn = get_db()
     rows = conn.execute("""
-        SELECT distance_cm, bar_name, bar_rating, fresh_photo_uri, timestamp
+        SELECT id, distance_cm, bar_name, bar_rating, fresh_photo_uri, timestamp
         FROM scores WHERE username=?
         ORDER BY bar_rating DESC, distance_cm ASC
     """, (username,)).fetchall()
