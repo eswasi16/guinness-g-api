@@ -38,8 +38,16 @@ def init_db():
             timestamp TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
+
 
 init_db()
 
@@ -167,3 +175,62 @@ def get_user_scores(username: str):
     ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+# --- Create or Get Profile ---
+@app.post("/profile")
+async def create_profile(payload: dict):
+    username = payload.get("username", "").strip()
+    if not username:
+        return {"error": "Username is required"}
+    
+    conn = get_db()
+    
+    # Check if username already exists
+    existing = conn.execute(
+        "SELECT * FROM profiles WHERE username=?", (username,)
+    ).fetchone()
+    
+    if existing:
+        conn.close()
+        return {"status": "exists", "username": username, "message": f"Welcome back, {username}!"}
+    
+    # Create new profile
+    conn.execute(
+        "INSERT INTO profiles (username, created_at) VALUES (?,?)",
+        (username, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "created", "username": username, "message": f"Profile created for {username}!"}
+
+# --- Get Profile Stats ---
+@app.get("/profile/{username}")
+def get_profile(username: str):
+    conn = get_db()
+    
+    profile = conn.execute(
+        "SELECT * FROM profiles WHERE username=?", (username,)
+    ).fetchone()
+    
+    if not profile:
+        conn.close()
+        return {"error": "Profile not found"}
+    
+    stats = conn.execute("""
+        SELECT
+            COUNT(*) as total_pours,
+            ROUND(AVG(distance_cm), 2) as avg_cm,
+            ROUND(MIN(distance_cm), 2) as best_pour,
+            ROUND(MAX(distance_cm), 2) as worst_pour
+        FROM scores WHERE username=?
+    """, (username,)).fetchone()
+    
+    conn.close()
+    return {
+        "username": username,
+        "created_at": profile["created_at"],
+        "total_pours": stats["total_pours"] or 0,
+        "avg_cm": stats["avg_cm"] or 0,
+        "best_pour": stats["best_pour"] or 0,
+        "worst_pour": stats["worst_pour"] or 0,
+    }
