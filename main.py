@@ -39,7 +39,9 @@ def init_db():
             bar_name TEXT,
             bar_rating INTEGER,
             fresh_photo_uri TEXT,
-            timestamp TEXT NOT NULL
+            timestamp TEXT NOT NULL,
+            lat REAL,
+            lng REAL
         )
     """)
     conn.execute("""
@@ -59,7 +61,7 @@ def init_db():
             UNIQUE(follower, following)
         )
     """)
-    for col in ["bar_name TEXT", "bar_rating INTEGER", "fresh_photo_uri TEXT"]:
+    for col in ["bar_name TEXT", "bar_rating INTEGER", "fresh_photo_uri TEXT", "lat REAL", "lng REAL"]:
         try:
             conn.execute(f"ALTER TABLE scores ADD COLUMN {col}")
         except:
@@ -142,19 +144,20 @@ async def save_score(payload: dict):
     bar_name = payload.get("bar_name", "Unknown Bar")
     bar_rating = payload.get("bar_rating", None)
     fresh_photo_uri = payload.get("fresh_photo_uri", None)
+    lat = payload.get("lat", None)
+    lng = payload.get("lng", None)
 
     conn = get_db()
     conn.execute(
         """INSERT INTO scores
            (username, distance_cm, description, bar_name,
-            bar_rating, fresh_photo_uri, timestamp)
-           VALUES (?,?,?,?,?,?,?)""",
+            bar_rating, fresh_photo_uri, timestamp, lat, lng)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
         (username, distance_cm, description, bar_name,
-         bar_rating, fresh_photo_uri, datetime.now().isoformat())
+         bar_rating, fresh_photo_uri, datetime.now().isoformat(), lat, lng)
     )
     conn.commit()
 
-    # Notify followers if 4+ stars
     if bar_rating and bar_rating >= 4:
         followers = conn.execute(
             "SELECT follower FROM friends WHERE following=?", (username,)
@@ -246,7 +249,9 @@ def get_bars():
             ROUND(AVG(distance_cm), 2) as avg_cm,
             ROUND(AVG(bar_rating), 1) as avg_rating,
             COUNT(*) as total_pours,
-            COUNT(DISTINCT username) as unique_visitors
+            COUNT(DISTINCT username) as unique_visitors,
+            AVG(lat) as lat,
+            AVG(lng) as lng
         FROM scores
         WHERE bar_name IS NOT NULL AND bar_name != 'Unknown Bar'
         GROUP BY bar_name
