@@ -458,17 +458,6 @@ async def leaderboard():
     conn.close()
     return [dict(r) for r in rows]
 
-# ── GLOBAL STATS ──────────────────────────────────────────────────────────────
-
-@app.get("/stats/global")
-async def global_stats():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) as total FROM scores")
-    total = c.fetchone()["total"]
-    conn.close()
-    return {"total_pours": total}
-
 # ── BARS ──────────────────────────────────────────────────────────────────────
 
 @app.get("/bars")
@@ -849,6 +838,16 @@ distance_cm is cm between beer line and G center (0 = perfect split)."""
         "beer_line_pct": round(beer_line_pct, 1),
         "measurement_method": "opencv",
     }
+# ── GLOBAL STATS ──────────────────────────────────────────────────────────────
+
+@app.get("/stats/global")
+async def global_stats():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) as total FROM scores WHERE distance_cm IS NOT NULL")
+    total = c.fetchone()["total"]
+    conn.close()
+    return {"total_pours": total}
 
 # ── HEALTH ────────────────────────────────────────────────────────────────────
 
