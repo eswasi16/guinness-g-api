@@ -8,9 +8,11 @@ import re
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from pathlib import Path
 from email_validator import validate_email, EmailNotValidError
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 import bcrypt
 import jwt
 import numpy as np
@@ -25,6 +27,8 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "changeme-use-env-var")
 SMTP_EMAIL = os.environ.get("SMTP_EMAIL")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 DB = "scores.db"
+UPLOAD_DIR = "uploads"
+Path(UPLOAD_DIR).mkdir(exist_ok=True)
 
 # ── DB SETUP ──────────────────────────────────────────────────────────────────
 
@@ -43,6 +47,7 @@ def init_db():
             password_hash TEXT,
             first_name TEXT,
             last_name TEXT,
+            photo_url TEXT,
             reset_token TEXT,
             reset_token_expires TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -69,23 +74,18 @@ def init_db():
             PRIMARY KEY (follower, following)
         )
     """)
-    # Migrate existing users table if columns missing
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN last_name TEXT")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN reset_token TEXT")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN reset_token_expires TEXT")
-    except Exception:
-        pass
+    # Migrations
+    for col in [
+        "ALTER TABLE users ADD COLUMN first_name TEXT",
+        "ALTER TABLE users ADD COLUMN last_name TEXT",
+        "ALTER TABLE users ADD COLUMN photo_url TEXT",
+        "ALTER TABLE users ADD COLUMN reset_token TEXT",
+        "ALTER TABLE users ADD COLUMN reset_token_expires TEXT",
+    ]:
+        try:
+            c.execute(col)
+        except Exception:
+            pass
     conn.commit()
     conn.close()
 
@@ -191,6 +191,7 @@ async def signup(body: dict):
         "username": username,
         "first_name": first_name,
         "last_name": last_name,
+        "photo_url": None,
         "message": f"Welcome, {first_name}!"
     }
 
@@ -202,7 +203,7 @@ async def login(body: dict):
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "SELECT username, password_hash, first_name, last_name FROM users WHERE username = ?",
+        "SELECT username, password_hash, first_name, last_name, photo_url FROM users WHERE username = ?",
         (username,)
     )
     row = c.fetchone()
@@ -219,7 +220,8 @@ async def login(body: dict):
         "token": token,
         "username": row["username"],
         "first_name": row["first_name"],
-        "last_name": row["last_name"]
+        "last_name": row["last_name"],
+        "photo_url": row["photo_url"],
     }
 
 @app.post("/auth/forgot-password")
@@ -305,7 +307,7 @@ async def get_profile(username: str):
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "SELECT username, first_name, last_name, created_at FROM users WHERE username = ?",
+        "SELECT username, first_name, last_name, photo_url, created_at FROM users WHERE username = ?",
         (username,)
     )
     user = c.fetchone()
@@ -325,12 +327,54 @@ async def get_profile(username: str):
         "username": user["username"],
         "first_name": user["first_name"],
         "last_name": user["last_name"],
+        "photo_url": user["photo_url"],
         "created_at": user["created_at"],
         "total_pours": stats["total"] or 0,
         "avg_cm": stats["avg_cm"],
         "best_rating": stats["best_rating"],
         "worst_rating": stats["worst_rating"],
     }
+
+@app.post("/profile/{username}/edit")
+async def edit_profile(username: str, body: dict):
+    first_name = body.get("first_name", "").strip()
+    last_name = body.get("last_name", "").strip()
+    if not first_name or not last_name:
+        return {"error": "First and last name are required"}
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET first_name = ?, last_name = ? WHERE username = ?",
+        (first_name, last_name, username)
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "first_name": first_name, "last_name": last_name}
+
+@app.post("/profile/{username}/photo")
+async def upload_profile_photo(username: str, file: UploadFile = File(...)):
+    ext = file.filename.split(".")[-1].lower()
+    if ext not in ["jpg", "jpeg", "png"]:
+        return {"error": "Only jpg/png allowed"}
+    img_bytes = await file.read()
+    filename = f"{username}_avatar.{ext}"
+    path = os.path.join(UPLOAD_DIR, filename)
+    with open(path, "wb") as f:
+        f.write(img_bytes)
+    photo_url = f"/uploads/{filename}"
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET photo_url = ? WHERE username = ?", (photo_url, username))
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "photo_url": photo_url}
+
+@app.get("/uploads/{filename}")
+async def serve_upload(filename: str):
+    path = os.path.join(UPLOAD_DIR, filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path)
 
 @app.get("/profile/{username}/pours")
 async def get_profile_pours(username: str):
@@ -538,7 +582,6 @@ async def unfollow(body: dict):
 # ── IMAGE ANALYSIS ────────────────────────────────────────────────────────────
 
 def find_glass_roi(img):
-    """Detect the Guinness glass region using edge detection and contours."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blurred, 30, 100)
@@ -552,7 +595,6 @@ def find_glass_roi(img):
         x, y, cw, ch = cv2.boundingRect(cnt)
         area = cv2.contourArea(cnt)
         aspect = ch / max(cw, 1)
-        # Glass is tall and narrow, occupies significant portion of image
         if aspect > 1.5 and area > (h * w * 0.05) and cw > w * 0.1:
             score = area * aspect
             if score > best_score:
@@ -561,10 +603,6 @@ def find_glass_roi(img):
     return best
 
 def detect_beer_line(img, roi=None):
-    """
-    Detect the beer/foam boundary line.
-    Returns the beer line Y position as a percentage from bottom (0-100).
-    """
     h, w = img.shape[:2]
     if roi:
         x, y, rw, rh = roi
@@ -575,55 +613,38 @@ def detect_beer_line(img, roi=None):
 
     rh, rw = region.shape[:2]
     hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-
-    # Guinness dark stout mask
     dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 75))
-    # Creamy foam mask
     cream_mask = cv2.inRange(hsv, (15, 10, 160), (45, 130, 255))
-
     dark_ratio = np.sum(dark_mask > 0) / (rh * rw)
     cream_ratio = np.sum(cream_mask > 0) / (rh * rw)
 
     if dark_ratio < 0.03:
         return None, dark_ratio, cream_ratio
 
-    # Scan rows from top to bottom to find transition from foam to dark
-    # Smooth the masks vertically
     dark_cols = np.sum(dark_mask > 0, axis=1).astype(float)
     cream_cols = np.sum(cream_mask > 0, axis=1).astype(float)
-
-    # Normalize per row
     dark_pct = dark_cols / rw
     cream_pct = cream_cols / rw
 
-    # Smooth
     kernel_size = max(3, rh // 30)
     dark_smooth = np.convolve(dark_pct, np.ones(kernel_size)/kernel_size, mode='same')
     cream_smooth = np.convolve(cream_pct, np.ones(kernel_size)/kernel_size, mode='same')
 
-    # Find the transition: look for where foam ends and dark begins (top-down)
     beer_line_y = None
     for row in range(rh // 4, int(rh * 0.85)):
         if dark_smooth[row] > 0.25 and cream_smooth[max(0, row-kernel_size):row].mean() > 0.05:
             beer_line_y = row
             break
 
-    # Fallback: find row with maximum cream-to-dark gradient
     if beer_line_y is None:
         diff = np.gradient(dark_smooth - cream_smooth)
         beer_line_y = int(np.argmax(diff[rh//4:int(rh*0.85)]) + rh//4)
 
-    # Convert to absolute image coords
     abs_y = beer_line_y + y
     beer_line_pct = ((h - abs_y) / h) * 100
     return beer_line_pct, dark_ratio, cream_ratio
 
 def detect_g_logo(img, roi=None):
-    """
-    Detect the Guinness G logo position using template-style color segmentation.
-    The G is a golden/harp logo typically in the lower-middle of the glass.
-    Returns G midpoint as percentage from bottom (0-100).
-    """
     h, w = img.shape[:2]
     if roi:
         x, y, rw, rh = roi
@@ -635,16 +656,10 @@ def detect_g_logo(img, roi=None):
 
     rh, rw = region.shape[:2]
     hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-
-    # Gold/amber harp color range
     gold_mask = cv2.inRange(hsv, (15, 80, 120), (35, 255, 255))
-    # White label area
     white_mask = cv2.inRange(hsv, (0, 0, 180), (180, 40, 255))
-
     gold_ratio = np.sum(gold_mask > 0) / (rh * rw)
-    white_ratio = np.sum(white_mask > 0) / (rh * rw)
 
-    # Try to find the label patch (white rectangle with gold G)
     label_mask = cv2.bitwise_or(gold_mask, white_mask)
     label_mask = cv2.morphologyEx(label_mask, cv2.MORPH_CLOSE,
                                    np.ones((15, 15), np.uint8))
@@ -657,7 +672,6 @@ def detect_g_logo(img, roi=None):
         area = cv2.contourArea(cnt)
         x2, y2, cw, ch = cv2.boundingRect(cnt)
         aspect = cw / max(ch, 1)
-        # Label is roughly square-ish, not too large, not tiny
         if 0.4 < aspect < 2.5 and (rh * rw * 0.005) < area < (rh * rw * 0.35):
             score = area
             if score > best_score:
@@ -670,7 +684,6 @@ def detect_g_logo(img, roi=None):
         g_midpoint_pct = ((h - center_y) / h) * 100
         return g_midpoint_pct, True, gold_ratio
 
-    # Fallback: use the gold pixels centroid
     if gold_ratio > 0.005:
         gold_ys = np.where(gold_mask > 0)[0]
         if len(gold_ys) > 0:
@@ -678,19 +691,12 @@ def detect_g_logo(img, roi=None):
             g_midpoint_pct = ((h - center_y) / h) * 100
             return g_midpoint_pct, True, gold_ratio
 
-    # Default: assume G is at ~35% from bottom (standard Guinness glass)
     return 35.0, False, gold_ratio
 
-def calculate_distance_cm(beer_line_pct, g_midpoint_pct, glass_height_px=None):
-    """
-    Convert the percentage gap to centimeters.
-    A standard Guinness pint glass is ~16cm tall.
-    1% of glass height ≈ 0.16cm.
-    """
+def calculate_distance_cm(beer_line_pct, g_midpoint_pct):
     GLASS_HEIGHT_CM = 16.0
     diff_pct = abs(beer_line_pct - g_midpoint_pct)
-    distance_cm = round((diff_pct / 100) * GLASS_HEIGHT_CM, 2)
-    return distance_cm
+    return round((diff_pct / 100) * GLASS_HEIGHT_CM, 2)
 
 def get_beer_line_position(beer_line_pct, g_midpoint_pct):
     if abs(beer_line_pct - g_midpoint_pct) < 1.0:
@@ -732,8 +738,6 @@ async def analyze(file: UploadFile = File(...)):
         }
 
     h, w = img.shape[:2]
-
-    # ── Step 1: Basic glass/beer detection ──
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 75))
     cream_mask = cv2.inRange(hsv, (15, 10, 160), (45, 130, 255))
@@ -763,27 +767,20 @@ async def analyze(file: UploadFile = File(...)):
             "measurement_method": "opencv",
         }
 
-    # ── Step 2: Find glass ROI ──
     roi = find_glass_roi(img)
 
-    # ── Step 3: Detect beer/foam line ──
     beer_line_pct, _, _ = detect_beer_line(img, roi)
     if beer_line_pct is None:
-        beer_line_pct = 70.0  # fallback: assume beer is near top
+        beer_line_pct = 70.0
 
-    # ── Step 4: Detect G logo ──
     g_midpoint_pct, g_detected, gold_ratio = detect_g_logo(img, roi)
 
-    # ── Step 5: Calculate distance ──
     distance_cm = calculate_distance_cm(beer_line_pct, g_midpoint_pct)
     beer_line_position = get_beer_line_position(beer_line_pct, g_midpoint_pct)
     description = build_description(distance_cm, beer_line_position, g_detected)
 
-    # ── Step 6: AI fallback only if OpenCV confidence is low ──
-    # Trigger AI if: G not detected AND gold ratio is very low (label not visible)
-    USE_AI_FALLBACK = gold_ratio < 0.003 and not g_detected
-
-    if USE_AI_FALLBACK:
+    # AI fallback only when label is not visible
+    if gold_ratio < 0.003 and not g_detected:
         try:
             b64 = base64.b64encode(img_bytes).decode("utf-8")
             prompt = """Analyze this Guinness pint glass image.
