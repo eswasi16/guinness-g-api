@@ -537,95 +537,309 @@ async def unfollow(body: dict):
 
 # ── IMAGE ANALYSIS ────────────────────────────────────────────────────────────
 
-def analyze_with_opencv(img_bytes: bytes):
-    nparr = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
+def find_glass_roi(img):
+    """Detect the Guinness glass region using edge detection and contours."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 30, 100)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
         return None
     h, w = img.shape[:2]
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 80))
-    cream_mask = cv2.inRange(hsv, (15, 20, 180), (40, 120, 255))
-    dark_ratio = np.sum(dark_mask > 0) / (h * w)
-    cream_ratio = np.sum(cream_mask > 0) / (h * w)
-    glass_detected = dark_ratio > 0.03
-    beer_present = dark_ratio > 0.05 and cream_ratio > 0.01
-    return {
-        "glass_detected": glass_detected,
-        "beer_present": beer_present,
-        "dark_ratio": float(dark_ratio),
-        "cream_ratio": float(cream_ratio),
-    }
+    best = None
+    best_score = 0
+    for cnt in contours:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        area = cv2.contourArea(cnt)
+        aspect = ch / max(cw, 1)
+        # Glass is tall and narrow, occupies significant portion of image
+        if aspect > 1.5 and area > (h * w * 0.05) and cw > w * 0.1:
+            score = area * aspect
+            if score > best_score:
+                best_score = score
+                best = (x, y, cw, ch)
+    return best
+
+def detect_beer_line(img, roi=None):
+    """
+    Detect the beer/foam boundary line.
+    Returns the beer line Y position as a percentage from bottom (0-100).
+    """
+    h, w = img.shape[:2]
+    if roi:
+        x, y, rw, rh = roi
+        region = img[y:y+rh, x:x+rw]
+    else:
+        region = img
+        y = 0
+
+    rh, rw = region.shape[:2]
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+
+    # Guinness dark stout mask
+    dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 75))
+    # Creamy foam mask
+    cream_mask = cv2.inRange(hsv, (15, 10, 160), (45, 130, 255))
+
+    dark_ratio = np.sum(dark_mask > 0) / (rh * rw)
+    cream_ratio = np.sum(cream_mask > 0) / (rh * rw)
+
+    if dark_ratio < 0.03:
+        return None, dark_ratio, cream_ratio
+
+    # Scan rows from top to bottom to find transition from foam to dark
+    # Smooth the masks vertically
+    dark_cols = np.sum(dark_mask > 0, axis=1).astype(float)
+    cream_cols = np.sum(cream_mask > 0, axis=1).astype(float)
+
+    # Normalize per row
+    dark_pct = dark_cols / rw
+    cream_pct = cream_cols / rw
+
+    # Smooth
+    kernel_size = max(3, rh // 30)
+    dark_smooth = np.convolve(dark_pct, np.ones(kernel_size)/kernel_size, mode='same')
+    cream_smooth = np.convolve(cream_pct, np.ones(kernel_size)/kernel_size, mode='same')
+
+    # Find the transition: look for where foam ends and dark begins (top-down)
+    beer_line_y = None
+    for row in range(rh // 4, int(rh * 0.85)):
+        if dark_smooth[row] > 0.25 and cream_smooth[max(0, row-kernel_size):row].mean() > 0.05:
+            beer_line_y = row
+            break
+
+    # Fallback: find row with maximum cream-to-dark gradient
+    if beer_line_y is None:
+        diff = np.gradient(dark_smooth - cream_smooth)
+        beer_line_y = int(np.argmax(diff[rh//4:int(rh*0.85)]) + rh//4)
+
+    # Convert to absolute image coords
+    abs_y = beer_line_y + y
+    beer_line_pct = ((h - abs_y) / h) * 100
+    return beer_line_pct, dark_ratio, cream_ratio
+
+def detect_g_logo(img, roi=None):
+    """
+    Detect the Guinness G logo position using template-style color segmentation.
+    The G is a golden/harp logo typically in the lower-middle of the glass.
+    Returns G midpoint as percentage from bottom (0-100).
+    """
+    h, w = img.shape[:2]
+    if roi:
+        x, y, rw, rh = roi
+        region = img[y:y+rh, x:x+rw]
+        offset_y = y
+    else:
+        region = img
+        offset_y = 0
+
+    rh, rw = region.shape[:2]
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+
+    # Gold/amber harp color range
+    gold_mask = cv2.inRange(hsv, (15, 80, 120), (35, 255, 255))
+    # White label area
+    white_mask = cv2.inRange(hsv, (0, 0, 180), (180, 40, 255))
+
+    gold_ratio = np.sum(gold_mask > 0) / (rh * rw)
+    white_ratio = np.sum(white_mask > 0) / (rh * rw)
+
+    # Try to find the label patch (white rectangle with gold G)
+    label_mask = cv2.bitwise_or(gold_mask, white_mask)
+    label_mask = cv2.morphologyEx(label_mask, cv2.MORPH_CLOSE,
+                                   np.ones((15, 15), np.uint8))
+    contours, _ = cv2.findContours(label_mask, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+
+    best_cnt = None
+    best_score = 0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        x2, y2, cw, ch = cv2.boundingRect(cnt)
+        aspect = cw / max(ch, 1)
+        # Label is roughly square-ish, not too large, not tiny
+        if 0.4 < aspect < 2.5 and (rh * rw * 0.005) < area < (rh * rw * 0.35):
+            score = area
+            if score > best_score:
+                best_score = score
+                best_cnt = cnt
+
+    if best_cnt is not None:
+        x2, y2, cw, ch = cv2.boundingRect(best_cnt)
+        center_y = y2 + ch // 2 + offset_y
+        g_midpoint_pct = ((h - center_y) / h) * 100
+        return g_midpoint_pct, True, gold_ratio
+
+    # Fallback: use the gold pixels centroid
+    if gold_ratio > 0.005:
+        gold_ys = np.where(gold_mask > 0)[0]
+        if len(gold_ys) > 0:
+            center_y = int(np.median(gold_ys)) + offset_y
+            g_midpoint_pct = ((h - center_y) / h) * 100
+            return g_midpoint_pct, True, gold_ratio
+
+    # Default: assume G is at ~35% from bottom (standard Guinness glass)
+    return 35.0, False, gold_ratio
+
+def calculate_distance_cm(beer_line_pct, g_midpoint_pct, glass_height_px=None):
+    """
+    Convert the percentage gap to centimeters.
+    A standard Guinness pint glass is ~16cm tall.
+    1% of glass height ≈ 0.16cm.
+    """
+    GLASS_HEIGHT_CM = 16.0
+    diff_pct = abs(beer_line_pct - g_midpoint_pct)
+    distance_cm = round((diff_pct / 100) * GLASS_HEIGHT_CM, 2)
+    return distance_cm
+
+def get_beer_line_position(beer_line_pct, g_midpoint_pct):
+    if abs(beer_line_pct - g_midpoint_pct) < 1.0:
+        return "at_g"
+    elif beer_line_pct > g_midpoint_pct:
+        return "above_g"
+    else:
+        return "below_g"
+
+def build_description(distance_cm, beer_line_position, g_detected):
+    if not g_detected:
+        return "G logo not clearly detected — show the Guinness label for best results."
+    if distance_cm == 0:
+        return "Perfect split! The beer line bisects the G logo perfectly."
+    pos = beer_line_position.replace("_", " ")
+    if distance_cm <= 0.3:
+        return f"Nearly perfect — the beer line is just {distance_cm}cm {pos}."
+    elif distance_cm <= 1.0:
+        return f"Good pour — {distance_cm}cm off, beer line is {pos}."
+    elif distance_cm <= 2.5:
+        return f"Not bad — {distance_cm}cm off, beer line is {pos}. Keep practicing!"
+    else:
+        return f"Needs work — {distance_cm}cm off, beer line is {pos}."
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     img_bytes = await file.read()
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    opencv_result = analyze_with_opencv(img_bytes)
-    if opencv_result and not opencv_result["glass_detected"]:
+    if img is None:
         return {
-            "glass_detected": False,
-            "beer_present": False,
-            "g_detected": False,
-            "distance_cm": None,
-            "description": "No Guinness glass detected.",
+            "glass_detected": False, "beer_present": False,
+            "g_detected": False, "distance_cm": None,
+            "description": "Could not read image.",
             "beer_line_position": None,
-            "g_midpoint_pct": 50,
-            "beer_line_pct": 50,
+            "g_midpoint_pct": 35, "beer_line_pct": 50,
             "measurement_method": "opencv",
         }
 
-    b64 = base64.b64encode(img_bytes).decode("utf-8")
+    h, w = img.shape[:2]
 
-    prompt = """Analyze this image of a Guinness pint glass.
+    # ── Step 1: Basic glass/beer detection ──
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 75))
+    cream_mask = cv2.inRange(hsv, (15, 10, 160), (45, 130, 255))
+    dark_ratio = np.sum(dark_mask > 0) / (h * w)
+    cream_ratio = np.sum(cream_mask > 0) / (h * w)
 
-Return ONLY valid JSON with these exact fields:
+    glass_detected = dark_ratio > 0.04
+    beer_present = dark_ratio > 0.06 and cream_ratio > 0.008
+
+    if not glass_detected:
+        return {
+            "glass_detected": False, "beer_present": False,
+            "g_detected": False, "distance_cm": None,
+            "description": "No Guinness glass detected. Make sure the glass fills most of the frame.",
+            "beer_line_position": None,
+            "g_midpoint_pct": 35, "beer_line_pct": 50,
+            "measurement_method": "opencv",
+        }
+
+    if not beer_present:
+        return {
+            "glass_detected": True, "beer_present": False,
+            "g_detected": False, "distance_cm": None,
+            "description": "Glass detected but no beer visible. Is it empty?",
+            "beer_line_position": None,
+            "g_midpoint_pct": 35, "beer_line_pct": 50,
+            "measurement_method": "opencv",
+        }
+
+    # ── Step 2: Find glass ROI ──
+    roi = find_glass_roi(img)
+
+    # ── Step 3: Detect beer/foam line ──
+    beer_line_pct, _, _ = detect_beer_line(img, roi)
+    if beer_line_pct is None:
+        beer_line_pct = 70.0  # fallback: assume beer is near top
+
+    # ── Step 4: Detect G logo ──
+    g_midpoint_pct, g_detected, gold_ratio = detect_g_logo(img, roi)
+
+    # ── Step 5: Calculate distance ──
+    distance_cm = calculate_distance_cm(beer_line_pct, g_midpoint_pct)
+    beer_line_position = get_beer_line_position(beer_line_pct, g_midpoint_pct)
+    description = build_description(distance_cm, beer_line_position, g_detected)
+
+    # ── Step 6: AI fallback only if OpenCV confidence is low ──
+    # Trigger AI if: G not detected AND gold ratio is very low (label not visible)
+    USE_AI_FALLBACK = gold_ratio < 0.003 and not g_detected
+
+    if USE_AI_FALLBACK:
+        try:
+            b64 = base64.b64encode(img_bytes).decode("utf-8")
+            prompt = """Analyze this Guinness pint glass image.
+Return ONLY valid JSON:
 {
-  "glass_detected": bool,
-  "beer_present": bool,
   "g_detected": bool,
-  "g_midpoint_pct": float (0-100, vertical % from bottom of glass where center of G logo is),
-  "beer_line_pct": float (0-100, vertical % from bottom of glass where beer/foam line is),
-  "distance_cm": float (estimated cm between beer line and G midpoint, 0 if perfect),
-  "beer_line_position": string (one of: "above_g", "at_g", "below_g"),
-  "description": string (one sentence describing the pour quality)
+  "g_midpoint_pct": float,
+  "beer_line_pct": float,
+  "distance_cm": float,
+  "beer_line_position": string
 }
-
-The "Split the G" challenge: the beer/foam line should bisect the G logo perfectly.
-If the beer line is exactly at the G midpoint, distance_cm = 0 (perfect split).
-Be precise with measurements."""
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                ]
-            }],
-            max_tokens=300,
-        )
-        text = response.choices[0].message.content
-        match = re.search(r'\{[^{}]+\}', text, re.DOTALL)
-        if match:
-            result = json.loads(match.group())
-            result["measurement_method"] = "gpt-4o"
-            return result
-    except Exception as e:
-        print(f"OpenAI error: {e}")
+g_midpoint_pct and beer_line_pct are 0-100 from bottom of glass.
+distance_cm is cm between beer line and G center (0 = perfect split)."""
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                    ]
+                }],
+                max_tokens=150,
+            )
+            text = response.choices[0].message.content
+            match = re.search(r'\{[^{}]+\}', text, re.DOTALL)
+            if match:
+                ai = json.loads(match.group())
+                g_midpoint_pct = ai.get("g_midpoint_pct", g_midpoint_pct)
+                beer_line_pct = ai.get("beer_line_pct", beer_line_pct)
+                distance_cm = ai.get("distance_cm", distance_cm)
+                beer_line_position = ai.get("beer_line_position", beer_line_position)
+                g_detected = ai.get("g_detected", g_detected)
+                description = build_description(distance_cm, beer_line_position, g_detected)
+                return {
+                    "glass_detected": True, "beer_present": True,
+                    "g_detected": g_detected, "distance_cm": distance_cm,
+                    "description": description,
+                    "beer_line_position": beer_line_position,
+                    "g_midpoint_pct": g_midpoint_pct,
+                    "beer_line_pct": beer_line_pct,
+                    "measurement_method": "opencv+ai",
+                }
+        except Exception as e:
+            print(f"AI fallback failed: {e}")
 
     return {
         "glass_detected": True,
         "beer_present": True,
-        "g_detected": False,
-        "distance_cm": None,
-        "description": "Could not analyze image. Try again with better lighting.",
-        "beer_line_position": None,
-        "g_midpoint_pct": 50,
-        "beer_line_pct": 50,
-        "measurement_method": "fallback",
+        "g_detected": g_detected,
+        "distance_cm": distance_cm,
+        "description": description,
+        "beer_line_position": beer_line_position,
+        "g_midpoint_pct": round(g_midpoint_pct, 1),
+        "beer_line_pct": round(beer_line_pct, 1),
+        "measurement_method": "opencv",
     }
 
 # ── HEALTH ────────────────────────────────────────────────────────────────────
