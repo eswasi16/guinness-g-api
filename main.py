@@ -778,27 +778,31 @@ async def analyze(file: UploadFile = File(...)):
 
     try:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
-        prompt = """You are analyzing a Guinness pint glass photo.
-Find the center of the letter G in the Guinness logo on the glass label.
-Also find the beer/foam boundary line where dark beer meets cream foam.
+        prompt = """You are analyzing a Guinness pint glass photo for the 'Split the G' game.
 
-Return ONLY this JSON:
+Your job is to find two things:
+1. The center of the letter G in the Guinness logo printed on the glass
+2. The boundary between dark beer and cream-colored foam/head
+
+IMPORTANT: All percentages are from the BOTTOM OF THE GLASS (not the image).
+- 0% = base of the glass
+- 100% = very top rim of the glass
+- The dark beer typically fills the bottom 50-70% of the glass
+- The cream foam sits on top of the beer
+- The Guinness G logo is printed on the glass in the lower half, usually around 25-40% from the bottom
+- The beer/foam line is where black beer transitions to cream/tan foam
+
+Return ONLY valid JSON, no other text:
 {
   "g_detected": true,
-  "g_midpoint_pct": 38.5,
-  "beer_line_pct": 51.2,
-  "distance_cm": 2.1,
-  "beer_line_position": "below_g"
+  "g_midpoint_pct": 35.0,
+  "beer_line_pct": 60.0,
+  "distance_cm": 4.0,
+  "beer_line_position": "above_g"
 }
 
-Rules:
-- g_midpoint_pct is the vertical center of the G letter as percent from the BOTTOM of the glass
-- beer_line_pct is the beer/foam boundary as percent from the BOTTOM of the glass
-- 0 means bottom of glass, 100 means top of glass
-- beer_line_position must be one of: "above_g", "below_g", "at_g"
-- distance_cm is the physical distance in cm between the beer line and G center
-- The G logo is usually in the LOWER THIRD of the glass
-- Be precise and visually estimate the actual G, not the foam line"""
+Carefully look at where the dark Guinness beer ends and the cream head begins — that is beer_line_pct.
+Carefully look at where the G letter sits on the label — that is g_midpoint_pct."""
 
         response = client.chat.completions.create(
             model="gpt-4o",
