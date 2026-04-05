@@ -778,31 +778,32 @@ async def analyze(file: UploadFile = File(...)):
 
     try:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
-        prompt = """You are analyzing a Guinness pint glass photo for the 'Split the G' game.
+        prompt = """You are playing 'Split the G' — a Guinness pouring game.
 
-Your job is to find two things:
-1. The center of the letter G in the Guinness logo printed on the glass
-2. The boundary between dark beer and cream-colored foam/head
+Look at this Guinness pint glass photo. Identify:
+1. The BOTTOM of the glass (where it sits on the table/bar)
+2. The TOP RIM of the glass
+3. The center of the letter G in the Guinness logo on the glass
+4. The line where dark beer meets cream foam
 
-IMPORTANT: All percentages are from the BOTTOM OF THE GLASS (not the image).
-- 0% = base of the glass
-- 100% = very top rim of the glass
-- The dark beer typically fills the bottom 50-70% of the glass
-- The cream foam sits on top of the beer
-- The Guinness G logo is printed on the glass in the lower half, usually around 25-40% from the bottom
-- The beer/foam line is where black beer transitions to cream/tan foam
+All percentages must be measured from the BOTTOM RIM of the glass to the TOP RIM of the glass.
+Ignore everything outside the glass (table, background, etc.).
 
-Return ONLY valid JSON, no other text:
+Example: if the glass takes up 60% of the image height and the G is halfway up the glass,
+g_midpoint_pct = 50 (halfway up the glass, not halfway up the image).
+
+Typical values for a properly framed Guinness glass:
+- G logo center: 35-50% up from glass bottom
+- Beer/foam line: 50-75% up from glass bottom
+
+Return ONLY valid JSON:
 {
   "g_detected": true,
-  "g_midpoint_pct": 35.0,
-  "beer_line_pct": 60.0,
-  "distance_cm": 4.0,
+  "g_midpoint_pct": 42.0,
+  "beer_line_pct": 58.0,
+  "distance_cm": 2.6,
   "beer_line_position": "above_g"
-}
-
-Carefully look at where the dark Guinness beer ends and the cream head begins — that is beer_line_pct.
-Carefully look at where the G letter sits on the label — that is g_midpoint_pct."""
+}"""
 
         response = client.chat.completions.create(
             model="gpt-4o",
