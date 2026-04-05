@@ -825,7 +825,7 @@ Return ONLY valid JSON:
             g_midpoint_pct = min(g_midpoint_pct + 17.0, 85.0)
             ai_beer_line = ai.get("beer_line_pct")
             if ai_beer_line is not None:
-                beer_line_pct = ai_beer_line
+                beer_line_pct = max(ai_beer_line - 6.0, 10.0)
             distance_cm = ai.get("distance_cm")
             beer_line_position = ai.get("beer_line_position", "below_g")
             g_detected = ai.get("g_detected", False)
