@@ -19,8 +19,10 @@ import numpy as np
 import cv2
 from openai import OpenAI
 
+
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 JWT_SECRET = os.environ.get("JWT_SECRET", "changeme-use-env-var")
@@ -30,12 +32,15 @@ DB = "scores.db"
 UPLOAD_DIR = "uploads"
 Path(UPLOAD_DIR).mkdir(exist_ok=True)
 
+
 # ── DB SETUP ──────────────────────────────────────────────────────────────────
+
 
 def get_db():
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     conn = get_db()
@@ -89,15 +94,20 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 init_db()
 
+
 # ── AUTH HELPERS ──────────────────────────────────────────────────────────────
+
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
+
 def verify_password(password: str, hashed: str) -> bool:
     return bcrypt.checkpw(password.encode(), hashed.encode())
+
 
 def create_token(username: str) -> str:
     payload = {
@@ -106,12 +116,14 @@ def create_token(username: str) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
+
 def validate_email_address(email: str) -> bool:
     try:
         validate_email(email, check_deliverability=False)
         return True
     except EmailNotValidError:
         return False
+
 
 def send_reset_email(to_email: str, username: str, reset_token: str):
     reset_link = f"https://splittheg.app/reset?token={reset_token}"
@@ -147,7 +159,9 @@ def send_reset_email(to_email: str, username: str, reset_token: str):
         print(f"Email send failed: {e}")
         return False
 
+
 # ── AUTH ROUTES ───────────────────────────────────────────────────────────────
+
 
 @app.post("/auth/signup")
 async def signup(body: dict):
@@ -195,6 +209,7 @@ async def signup(body: dict):
         "message": f"Welcome, {first_name}!"
     }
 
+
 @app.post("/auth/login")
 async def login(body: dict):
     username = body.get("username", "").strip()
@@ -224,6 +239,7 @@ async def login(body: dict):
         "photo_url": row["photo_url"],
     }
 
+
 @app.post("/auth/forgot-password")
 async def forgot_password(body: dict):
     email = body.get("email", "").strip().lower()
@@ -250,6 +266,7 @@ async def forgot_password(body: dict):
 
     send_reset_email(email, row["username"], reset_token)
     return {"status": "sent", "message": "If that email exists, a reset link has been sent."}
+
 
 @app.post("/auth/reset-password")
 async def reset_password(body: dict):
@@ -282,7 +299,9 @@ async def reset_password(body: dict):
     conn.close()
     return {"status": "ok", "message": "Password reset successfully. You can now log in."}
 
+
 # ── PROFILE ROUTES ────────────────────────────────────────────────────────────
+
 
 @app.post("/profile")
 async def create_profile(body: dict):
@@ -301,6 +320,7 @@ async def create_profile(body: dict):
     conn.commit()
     conn.close()
     return {"status": "created", "username": username, "message": f"Welcome, {username}!"}
+
 
 @app.get("/profile/{username}")
 async def get_profile(username: str):
@@ -335,6 +355,7 @@ async def get_profile(username: str):
         "worst_rating": stats["worst_rating"],
     }
 
+
 @app.post("/profile/{username}/edit")
 async def edit_profile(username: str, body: dict):
     first_name = body.get("first_name", "").strip()
@@ -350,6 +371,7 @@ async def edit_profile(username: str, body: dict):
     conn.commit()
     conn.close()
     return {"status": "ok", "first_name": first_name, "last_name": last_name}
+
 
 @app.post("/profile/{username}/photo")
 async def upload_profile_photo(username: str, file: UploadFile = File(...)):
@@ -369,12 +391,14 @@ async def upload_profile_photo(username: str, file: UploadFile = File(...)):
     conn.close()
     return {"status": "ok", "photo_url": photo_url}
 
+
 @app.get("/uploads/{filename}")
 async def serve_upload(filename: str):
     path = os.path.join(UPLOAD_DIR, filename)
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path)
+
 
 @app.get("/profile/{username}/pours")
 async def get_profile_pours(username: str):
@@ -392,7 +416,9 @@ async def get_profile_pours(username: str):
     conn.close()
     return [dict(r) for r in rows]
 
+
 # ── SCORES ROUTES ─────────────────────────────────────────────────────────────
+
 
 @app.post("/scores")
 async def submit_score(body: dict):
@@ -421,6 +447,7 @@ async def submit_score(body: dict):
     conn.close()
     return {"status": "saved"}
 
+
 @app.delete("/scores/{score_id}")
 async def delete_score(score_id: int, body: dict):
     username = body.get("username")
@@ -436,7 +463,9 @@ async def delete_score(score_id: int, body: dict):
     conn.close()
     return {"status": "deleted"}
 
+
 # ── LEADERBOARD ───────────────────────────────────────────────────────────────
+
 
 @app.get("/leaderboard")
 async def leaderboard():
@@ -458,7 +487,9 @@ async def leaderboard():
     conn.close()
     return [dict(r) for r in rows]
 
+
 # ── BARS ──────────────────────────────────────────────────────────────────────
+
 
 @app.get("/bars")
 async def get_bars():
@@ -483,6 +514,7 @@ async def get_bars():
     conn.close()
     return [dict(r) for r in rows]
 
+
 @app.get("/bars/search")
 async def search_bars(q: str = ""):
     conn = get_db()
@@ -496,7 +528,9 @@ async def search_bars(q: str = ""):
     conn.close()
     return [r["bar_name"] for r in rows]
 
+
 # ── FRIENDS ───────────────────────────────────────────────────────────────────
+
 
 @app.get("/friends/{username}")
 async def get_friends(username: str):
@@ -508,6 +542,7 @@ async def get_friends(username: str):
     followers = [r["follower"] for r in c.fetchall()]
     conn.close()
     return {"following": following, "followers": followers}
+
 
 @app.get("/friends/{username}/feed")
 async def friend_feed(username: str):
@@ -531,6 +566,7 @@ async def friend_feed(username: str):
     conn.close()
     return [dict(r) for r in rows]
 
+
 @app.get("/friends/{username}/search")
 async def search_users(username: str, q: str = ""):
     conn = get_db()
@@ -549,6 +585,7 @@ async def search_users(username: str, q: str = ""):
     conn.close()
     return [dict(r) for r in rows]
 
+
 @app.post("/friends/follow")
 async def follow(body: dict):
     follower = body.get("follower")
@@ -565,6 +602,7 @@ async def follow(body: dict):
     conn.close()
     return {"status": "followed"}
 
+
 @app.post("/friends/unfollow")
 async def unfollow(body: dict):
     follower = body.get("follower")
@@ -579,7 +617,9 @@ async def unfollow(body: dict):
     conn.close()
     return {"status": "unfollowed"}
 
-# ── IMAGE ANALYSIS ────────────────────────────────────────────────────────────
+
+# ── IMAGE ANALYSIS HELPERS ────────────────────────────────────────────────────
+
 
 def find_glass_roi(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -601,6 +641,7 @@ def find_glass_roi(img):
                 best_score = score
                 best = (x, y, cw, ch)
     return best
+
 
 def detect_beer_line(img, roi=None):
     h, w = img.shape[:2]
@@ -644,72 +685,12 @@ def detect_beer_line(img, roi=None):
     beer_line_pct = ((h - abs_y) / h) * 100
     return beer_line_pct, dark_ratio, cream_ratio
 
-def detect_g_logo(img, roi=None):
-    h, w = img.shape[:2]
-    if roi:
-        x, y, rw, rh = roi
-        region = img[y:y+rh, x:x+rw]
-        offset_y = y
-    else:
-        region = img
-        offset_y = 0
-
-    rh, rw = region.shape[:2]
-
-    # The Guinness label with the G sits in the BOTTOM HALF of the glass
-    # Only search the bottom 60% of the image to avoid foam confusion
-    search_start = int(rh * 0.35)
-    search_end = int(rh * 0.85)
-    search_region = region[search_start:search_end, :]
-    srh, srw = search_region.shape[:2]
-
-    hsv = cv2.cvtColor(search_region, cv2.COLOR_BGR2HSV)
-
-    # Gold/yellow tones of the Guinness label
-    gold_mask = cv2.inRange(hsv, (15, 80, 120), (35, 255, 255))
-    # White tones of the label text
-    white_mask = cv2.inRange(hsv, (0, 0, 180), (180, 40, 255))
-
-    gold_ratio = np.sum(gold_mask > 0) / (srh * srw)
-
-    label_mask = cv2.bitwise_or(gold_mask, white_mask)
-    label_mask = cv2.morphologyEx(label_mask, cv2.MORPH_CLOSE,
-                                   np.ones((15, 15), np.uint8))
-    contours, _ = cv2.findContours(label_mask, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)
-
-    best_cnt = None
-    best_score = 0
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        x2, y2, cw, ch = cv2.boundingRect(cnt)
-        aspect = cw / max(ch, 1)
-        if 0.4 < aspect < 3.5 and (srh * srw * 0.005) < area < (srh * srw * 0.5):
-            score = area
-            if score > best_score:
-                best_score = score
-                best_cnt = cnt
-
-    if best_cnt is not None:
-        x2, y2, cw, ch = cv2.boundingRect(best_cnt)
-        # center_y is within the search_region, need to add search_start + offset_y
-        center_y = y2 + ch // 2 + search_start + offset_y
-        g_midpoint_pct = ((h - center_y) / h) * 100
-        return g_midpoint_pct, True, gold_ratio
-
-    if gold_ratio > 0.005:
-        gold_ys = np.where(gold_mask > 0)[0]
-        if len(gold_ys) > 0:
-            center_y = int(np.median(gold_ys)) + search_start + offset_y
-            g_midpoint_pct = ((h - center_y) / h) * 100
-            return g_midpoint_pct, True, gold_ratio
-
-    return 35.0, False, gold_ratio
 
 def calculate_distance_cm(beer_line_pct, g_midpoint_pct):
     GLASS_HEIGHT_CM = 16.0
     diff_pct = abs(beer_line_pct - g_midpoint_pct)
     return round((diff_pct / 100) * GLASS_HEIGHT_CM, 2)
+
 
 def get_beer_line_position(beer_line_pct, g_midpoint_pct):
     if abs(beer_line_pct - g_midpoint_pct) < 1.0:
@@ -718,6 +699,7 @@ def get_beer_line_position(beer_line_pct, g_midpoint_pct):
         return "above_g"
     else:
         return "below_g"
+
 
 def build_description(distance_cm, beer_line_position, g_detected):
     if not g_detected:
@@ -733,6 +715,10 @@ def build_description(distance_cm, beer_line_position, g_detected):
         return f"Not bad — {distance_cm}cm off, beer line is {pos}. Keep practicing!"
     else:
         return f"Needs work — {distance_cm}cm off, beer line is {pos}."
+
+
+# ── IMAGE ANALYSIS ENDPOINT ───────────────────────────────────────────────────
+
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
@@ -780,65 +766,89 @@ async def analyze(file: UploadFile = File(...)):
             "measurement_method": "opencv",
         }
 
+    # Use OpenCV only for beer line
     roi = find_glass_roi(img)
-
     beer_line_pct, _, _ = detect_beer_line(img, roi)
     if beer_line_pct is None:
         beer_line_pct = 70.0
 
-    g_midpoint_pct, g_detected, gold_ratio = detect_g_logo(img, roi)
+    # Always use AI for G detection
+    g_midpoint_pct = 35.0
+    g_detected = False
 
+    try:
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        prompt = """You are analyzing a Guinness pint glass photo.
+Find the center of the letter G in the Guinness logo on the glass label.
+Also find the beer/foam boundary line where dark beer meets cream foam.
+
+Return ONLY this JSON:
+{
+  "g_detected": true,
+  "g_midpoint_pct": 38.5,
+  "beer_line_pct": 51.2,
+  "distance_cm": 2.1,
+  "beer_line_position": "below_g"
+}
+
+Rules:
+- g_midpoint_pct is the vertical center of the G letter as percent from the BOTTOM of the glass
+- beer_line_pct is the beer/foam boundary as percent from the BOTTOM of the glass
+- 0 means bottom of glass, 100 means top of glass
+- beer_line_position must be one of: "above_g", "below_g", "at_g"
+- distance_cm is the physical distance in cm between the beer line and G center
+- The G logo is usually in the LOWER THIRD of the glass
+- Be precise and visually estimate the actual G, not the foam line"""
+
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                ]
+            }],
+            max_tokens=150,
+        )
+
+        text = response.choices[0].message.content
+        match = re.search(r'\{[^{}]+\}', text, re.DOTALL)
+
+        if match:
+            ai = json.loads(match.group())
+            g_midpoint_pct = ai.get("g_midpoint_pct", 35.0)
+            ai_beer_line = ai.get("beer_line_pct")
+            if ai_beer_line is not None:
+                beer_line_pct = ai_beer_line
+            distance_cm = ai.get("distance_cm")
+            beer_line_position = ai.get("beer_line_position", "below_g")
+            g_detected = ai.get("g_detected", False)
+
+            if distance_cm is None:
+                distance_cm = calculate_distance_cm(beer_line_pct, g_midpoint_pct)
+
+            description = build_description(distance_cm, beer_line_position, g_detected)
+
+            return {
+                "glass_detected": True,
+                "beer_present": True,
+                "g_detected": g_detected,
+                "distance_cm": round(distance_cm, 2),
+                "description": description,
+                "beer_line_position": beer_line_position,
+                "g_midpoint_pct": round(g_midpoint_pct, 1),
+                "beer_line_pct": round(beer_line_pct, 1),
+                "measurement_method": "ai",
+            }
+
+    except Exception as e:
+        print(f"AI analysis failed: {e}")
+
+    # Fallback if AI fails
     distance_cm = calculate_distance_cm(beer_line_pct, g_midpoint_pct)
     beer_line_position = get_beer_line_position(beer_line_pct, g_midpoint_pct)
     description = build_description(distance_cm, beer_line_position, g_detected)
-
-    # AI fallback only when label is not visible
-    if True:
-        try:
-            b64 = base64.b64encode(img_bytes).decode("utf-8")
-            prompt = """Analyze this Guinness pint glass image.
-Return ONLY valid JSON:
-{
-  "g_detected": bool,
-  "g_midpoint_pct": float,
-  "beer_line_pct": float,
-  "distance_cm": float,
-  "beer_line_position": string
-}
-g_midpoint_pct and beer_line_pct are 0-100 from bottom of glass.
-distance_cm is cm between beer line and G center (0 = perfect split)."""
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                    ]
-                }],
-                max_tokens=150,
-            )
-            text = response.choices[0].message.content
-            match = re.search(r'\{[^{}]+\}', text, re.DOTALL)
-            if match:
-                ai = json.loads(match.group())
-                g_midpoint_pct = ai.get("g_midpoint_pct", g_midpoint_pct)
-                beer_line_pct = ai.get("beer_line_pct", beer_line_pct)
-                distance_cm = ai.get("distance_cm", distance_cm)
-                beer_line_position = ai.get("beer_line_position", beer_line_position)
-                g_detected = ai.get("g_detected", g_detected)
-                description = build_description(distance_cm, beer_line_position, g_detected)
-                return {
-                    "glass_detected": True, "beer_present": True,
-                    "g_detected": g_detected, "distance_cm": distance_cm,
-                    "description": description,
-                    "beer_line_position": beer_line_position,
-                    "g_midpoint_pct": g_midpoint_pct,
-                    "beer_line_pct": beer_line_pct,
-                    "measurement_method": "opencv+ai",
-                }
-        except Exception as e:
-            print(f"AI fallback failed: {e}")
 
     return {
         "glass_detected": True,
@@ -851,7 +861,10 @@ distance_cm is cm between beer line and G center (0 = perfect split)."""
         "beer_line_pct": round(beer_line_pct, 1),
         "measurement_method": "opencv",
     }
+
+
 # ── GLOBAL STATS ──────────────────────────────────────────────────────────────
+
 
 @app.get("/stats/global")
 async def global_stats():
@@ -862,7 +875,9 @@ async def global_stats():
     conn.close()
     return {"total_pours": total}
 
+
 # ── HEALTH ────────────────────────────────────────────────────────────────────
+
 
 @app.get("/health")
 async def health():
