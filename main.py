@@ -822,7 +822,7 @@ Return ONLY valid JSON:
 
         if match:
             ai = json.loads(match.group())
-            g_midpoint_pct = ai.get("g_midpoint_pct", 35.0)
+            g_midpoint_pct = min(g_midpoint_pct + 17.0, 85.0)
             ai_beer_line = ai.get("beer_line_pct")
             if ai_beer_line is not None:
                 beer_line_pct = ai_beer_line
