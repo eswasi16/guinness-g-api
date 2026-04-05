@@ -655,10 +655,22 @@ def detect_g_logo(img, roi=None):
         offset_y = 0
 
     rh, rw = region.shape[:2]
-    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+
+    # The Guinness label with the G sits in the BOTTOM HALF of the glass
+    # Only search the bottom 60% of the image to avoid foam confusion
+    search_start = int(rh * 0.35)
+    search_end = int(rh * 0.85)
+    search_region = region[search_start:search_end, :]
+    srh, srw = search_region.shape[:2]
+
+    hsv = cv2.cvtColor(search_region, cv2.COLOR_BGR2HSV)
+
+    # Gold/yellow tones of the Guinness label
     gold_mask = cv2.inRange(hsv, (15, 80, 120), (35, 255, 255))
+    # White tones of the label text
     white_mask = cv2.inRange(hsv, (0, 0, 180), (180, 40, 255))
-    gold_ratio = np.sum(gold_mask > 0) / (rh * rw)
+
+    gold_ratio = np.sum(gold_mask > 0) / (srh * srw)
 
     label_mask = cv2.bitwise_or(gold_mask, white_mask)
     label_mask = cv2.morphologyEx(label_mask, cv2.MORPH_CLOSE,
@@ -672,7 +684,7 @@ def detect_g_logo(img, roi=None):
         area = cv2.contourArea(cnt)
         x2, y2, cw, ch = cv2.boundingRect(cnt)
         aspect = cw / max(ch, 1)
-        if 0.4 < aspect < 2.5 and (rh * rw * 0.005) < area < (rh * rw * 0.35):
+        if 0.4 < aspect < 3.5 and (srh * srw * 0.005) < area < (srh * srw * 0.5):
             score = area
             if score > best_score:
                 best_score = score
@@ -680,14 +692,15 @@ def detect_g_logo(img, roi=None):
 
     if best_cnt is not None:
         x2, y2, cw, ch = cv2.boundingRect(best_cnt)
-        center_y = y2 + ch // 2 + offset_y
+        # center_y is within the search_region, need to add search_start + offset_y
+        center_y = y2 + ch // 2 + search_start + offset_y
         g_midpoint_pct = ((h - center_y) / h) * 100
         return g_midpoint_pct, True, gold_ratio
 
     if gold_ratio > 0.005:
         gold_ys = np.where(gold_mask > 0)[0]
         if len(gold_ys) > 0:
-            center_y = int(np.median(gold_ys)) + offset_y
+            center_y = int(np.median(gold_ys)) + search_start + offset_y
             g_midpoint_pct = ((h - center_y) / h) * 100
             return g_midpoint_pct, True, gold_ratio
 
@@ -780,7 +793,7 @@ async def analyze(file: UploadFile = File(...)):
     description = build_description(distance_cm, beer_line_position, g_detected)
 
     # AI fallback only when label is not visible
-    if gold_ratio < 0.003 and not g_detected:
+    if True:
         try:
             b64 = base64.b64encode(img_bytes).decode("utf-8")
             prompt = """Analyze this Guinness pint glass image.
