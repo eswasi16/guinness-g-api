@@ -647,46 +647,44 @@ def find_glass_roi(img):
 
 def detect_beer_line(img, roi=None):
     h, w = img.shape[:2]
-    if roi:
-        x, y, rw, rh = roi
-        region = img[y:y+rh, x:x+rw]
-    else:
-        region = img
-        y = 0
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    rh, rw = region.shape[:2]
-    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-    dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 75))
-    cream_mask = cv2.inRange(hsv, (15, 10, 160), (45, 130, 255))
-    dark_ratio = np.sum(dark_mask > 0) / (rh * rw)
-    cream_ratio = np.sum(cream_mask > 0) / (rh * rw)
+    # Dark beer mask (the Guinness body)
+    dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 80))
 
-    if dark_ratio < 0.03:
-        return None, dark_ratio, cream_ratio
+    # Scan rows from top down, find where dark pixels first become dominant
+    scan_x1 = int(w * 0.25)
+    scan_x2 = int(w * 0.75)
 
-    dark_cols = np.sum(dark_mask > 0, axis=1).astype(float)
-    cream_cols = np.sum(cream_mask > 0, axis=1).astype(float)
-    dark_pct = dark_cols / rw
-    cream_pct = cream_cols / rw
+    best_row = None
+    best_transition = 0
 
-    kernel_size = max(3, rh // 30)
-    dark_smooth = np.convolve(dark_pct, np.ones(kernel_size)/kernel_size, mode='same')
-    cream_smooth = np.convolve(cream_pct, np.ones(kernel_size)/kernel_size, mode='same')
+    for y in range(int(h * 0.2), int(h * 0.9)):
+        row = dark_mask[y, scan_x1:scan_x2]
+        dark_ratio = np.sum(row > 0) / len(row)
 
-    beer_line_y = None
-    for row in range(rh // 4, int(rh * 0.85)):
-        if dark_smooth[row] > 0.25 and cream_smooth[max(0, row-kernel_size):row].mean() > 0.05:
-            beer_line_y = row
-            break
+        row_above = dark_mask[max(0, y - 10), scan_x1:scan_x2]
+        dark_above = np.sum(row_above > 0) / len(row_above)
 
-    if beer_line_y is None:
-        diff = np.gradient(dark_smooth - cream_smooth)
-        beer_line_y = int(np.argmax(diff[rh//4:int(rh*0.85)]) + rh//4)
+        # Find the sharpest transition from light (cream) to dark (beer)
+        transition = dark_ratio - dark_above
+        if transition > best_transition and dark_ratio > 0.4:
+            best_transition = transition
+            best_row = y
 
-    abs_y = beer_line_y + y
-    beer_line_pct = ((h - abs_y) / h) * 100
-    return beer_line_pct, dark_ratio, cream_ratio
+    if best_row is None:
+        # Fallback: find first row where dark pixels dominate
+        for y in range(int(h * 0.2), int(h * 0.9)):
+            row = dark_mask[y, scan_x1:scan_x2]
+            if np.sum(row > 0) / len(row) > 0.5:
+                best_row = y
+                break
 
+    if best_row is None:
+        return None, None, None
+
+    beer_line_pct = (1 - best_row / h) * 100
+    return beer_line_pct, best_row, None
 
 def calculate_distance_cm(beer_line_pct, g_midpoint_pct):
     GLASS_HEIGHT_CM = 16.0
@@ -743,11 +741,11 @@ def detect_guinness_g(image_bgr: np.ndarray, img_bytes: bytes) -> Optional[dict]
     try:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-        prompt = f"""This is a photo of a Guinness pint glass (image is {w}px wide by {h}px tall).
+        prompt = f"""This is a photo of a Guinness pint glass ({w}px wide by {h}px tall).
 
-Find the white letter 'G' in the Guinness logo on the glass.
+Find the white letter 'G' — the first letter of the word GUINNESS printed on the glass.
 
-Return ONLY valid JSON with the bounding box of just the G letter in pixel coordinates:
+Return ONLY valid JSON with a tight bounding box around just the G letterform in pixel coordinates:
 {{
   "found": true,
   "x": 120,
@@ -756,9 +754,10 @@ Return ONLY valid JSON with the bounding box of just the G letter in pixel coord
   "h": 95
 }}
 
-Where x,y is the top-left corner of the G, and w,h is its width and height in pixels.
+x,y = top-left corner of the G. w,h = width and height in pixels.
+Make the box tight — just the G letter itself, not surrounding text.
 If you cannot find the G, return: {{"found": false}}
-Do not include any other text."""
+Return JSON only, no other text."""
 
         response = client.chat.completions.create(
             model="gpt-4o",
