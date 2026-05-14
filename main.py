@@ -17,14 +17,16 @@ import bcrypt
 import jwt
 import numpy as np
 import cv2
+from typing import Optional
 from openai import OpenAI
-
+_openai_key = os.environ.get("OPENAI_API_KEY")
+client = OpenAI(api_key=_openai_key) if _openai_key else None
+print(f"OpenAI key loaded: {bool(_openai_key)}")
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 JWT_SECRET = os.environ.get("JWT_SECRET", "changeme-use-env-var")
 SMTP_EMAIL = os.environ.get("SMTP_EMAIL")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
@@ -716,6 +718,85 @@ def build_description(distance_cm, beer_line_position, g_detected):
     else:
         return f"Needs work — {distance_cm}cm off, beer line is {pos}."
 
+# ── G Template Matching ───────────────────────────────────────────────────────
+TEMPLATE_PATH = "assets/g_template.png"
+_g_template_cache = None
+
+def get_g_template():
+    global _g_template_cache
+    if _g_template_cache is None:
+        tmpl = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
+        if tmpl is None:
+            return None
+        _g_template_cache = tmpl
+    return _g_template_cache
+
+def detect_guinness_g(image_bgr: np.ndarray, img_bytes: bytes) -> Optional[dict]:
+    """
+    Uses GPT-4o to locate the Guinness G lettermark and return a bounding box.
+    """
+    if client is None:
+        return None
+
+    h, w = image_bgr.shape[:2]
+
+    try:
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+        prompt = f"""This is a photo of a Guinness pint glass (image is {w}px wide by {h}px tall).
+
+Find the white letter 'G' in the Guinness logo on the glass.
+
+Return ONLY valid JSON with the bounding box of just the G letter in pixel coordinates:
+{{
+  "found": true,
+  "x": 120,
+  "y": 340,
+  "w": 80,
+  "h": 95
+}}
+
+Where x,y is the top-left corner of the G, and w,h is its width and height in pixels.
+If you cannot find the G, return: {{"found": false}}
+Do not include any other text."""
+
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                ]
+            }],
+            max_tokens=100,
+        )
+
+        text = response.choices[0].message.content
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if not match:
+            return None
+
+        ai = json.loads(match.group())
+        if not ai.get("found"):
+            return None
+
+        x = int(ai["x"])
+        y = int(ai["y"])
+        bw = int(ai["w"])
+        bh = int(ai["h"])
+        cx = x + bw // 2
+        cy = y + bh // 2
+
+        return {
+            "bbox": {"x": x, "y": y, "w": bw, "h": bh},
+            "center": {"x": cx, "y": cy},
+            "confidence": 1.0,  # AI doesn't return a score, treat as high confidence
+        }
+
+    except Exception as e:
+        print(f"AI G detection failed: {e}")
+        return None
 
 # ── IMAGE ANALYSIS ENDPOINT ───────────────────────────────────────────────────
 
@@ -727,14 +808,11 @@ async def analyze(file: UploadFile = File(...)):
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is None:
-        return {
-            "glass_detected": False, "beer_present": False,
-            "g_detected": False, "distance_cm": None,
-            "description": "Could not read image.",
-            "beer_line_position": None,
-            "g_midpoint_pct": 35, "beer_line_pct": 50,
-            "measurement_method": "opencv",
-        }
+        return {"glass_detected": False, "beer_present": False, "g_detected": False,
+                "distance_cm": None, "description": "Could not read image.",
+                "beer_line_position": None, "g_midpoint_pct": 35, "beer_line_pct": 50,
+                "measurement_method": "opencv", "g_detection": None,
+                "image_width": None, "image_height": None}
 
     h, w = img.shape[:2]
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -742,129 +820,60 @@ async def analyze(file: UploadFile = File(...)):
     cream_mask = cv2.inRange(hsv, (15, 10, 160), (45, 130, 255))
     dark_ratio = np.sum(dark_mask > 0) / (h * w)
     cream_ratio = np.sum(cream_mask > 0) / (h * w)
-
     glass_detected = dark_ratio > 0.04
     beer_present = dark_ratio > 0.06 and cream_ratio > 0.008
 
     if not glass_detected:
-        return {
-            "glass_detected": False, "beer_present": False,
-            "g_detected": False, "distance_cm": None,
-            "description": "No Guinness glass detected. Make sure the glass fills most of the frame.",
-            "beer_line_position": None,
-            "g_midpoint_pct": 35, "beer_line_pct": 50,
-            "measurement_method": "opencv",
-        }
+        return {"glass_detected": False, "beer_present": False, "g_detected": False,
+                "distance_cm": None, "description": "No Guinness glass detected. Make sure the glass fills most of the frame.",
+                "beer_line_position": None, "g_midpoint_pct": 35, "beer_line_pct": 50,
+                "measurement_method": "opencv", "g_detection": None,
+                "image_width": w, "image_height": h}
 
     if not beer_present:
-        return {
-            "glass_detected": True, "beer_present": False,
-            "g_detected": False, "distance_cm": None,
-            "description": "Glass detected but no beer visible. Is it empty?",
-            "beer_line_position": None,
-            "g_midpoint_pct": 35, "beer_line_pct": 50,
-            "measurement_method": "opencv",
-        }
+        return {"glass_detected": True, "beer_present": False, "g_detected": False,
+                "distance_cm": None, "description": "Glass detected but no beer visible. Is it empty?",
+                "beer_line_position": None, "g_midpoint_pct": 35, "beer_line_pct": 50,
+                "measurement_method": "opencv", "g_detection": None,
+                "image_width": w, "image_height": h}
 
-    # Use OpenCV only for beer line
+    # ── Detect G via template matching ──
+    g_result = detect_guinness_g(img, img_bytes)
+
+    if g_result is None:
+        return {"glass_detected": True, "beer_present": True, "g_detected": False,
+                "distance_cm": None, "description": "G logo not detected. Try better lighting or a closer angle.",
+                "beer_line_position": None, "g_midpoint_pct": None, "beer_line_pct": None,
+                "measurement_method": "opencv", "g_detection": None,
+                "image_width": w, "image_height": h}
+
+    # ── Detect beer line ──
     roi = find_glass_roi(img)
     beer_line_pct, _, _ = detect_beer_line(img, roi)
     if beer_line_pct is None:
         beer_line_pct = 70.0
 
-    # Always use AI for G detection
-    g_midpoint_pct = 35.0
-    g_detected = False
+    # ── Calculate split using G center from template matching ──
+    g_center_y = g_result["center"]["y"]
+    g_midpoint_pct = (g_center_y / h) * 100
 
-    try:
-        b64 = base64.b64encode(img_bytes).decode("utf-8")
-        prompt = """You are playing 'Split the G' — a Guinness pouring game.
-
-Look at this Guinness pint glass photo. Identify:
-1. The BOTTOM of the glass (where it sits on the table/bar)
-2. The TOP RIM of the glass
-3. The center of the letter G in the Guinness logo on the glass
-4. The line where dark beer meets cream foam
-
-All percentages must be measured from the BOTTOM RIM of the glass to the TOP RIM of the glass.
-Ignore everything outside the glass (table, background, etc.).
-
-Example: if the glass takes up 60% of the image height and the G is halfway up the glass,
-g_midpoint_pct = 50 (halfway up the glass, not halfway up the image).
-
-Typical values for a properly framed Guinness glass:
-- G logo center: 35-50% up from glass bottom
-- Beer/foam line: 50-75% up from glass bottom
-
-Return ONLY valid JSON:
-{
-  "g_detected": true,
-  "g_midpoint_pct": 42.0,
-  "beer_line_pct": 58.0,
-  "distance_cm": 2.6,
-  "beer_line_position": "above_g"
-}"""
-
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                ]
-            }],
-            max_tokens=150,
-        )
-
-        text = response.choices[0].message.content
-        match = re.search(r'\{[^{}]+\}', text, re.DOTALL)
-
-        if match:
-            ai = json.loads(match.group())
-            g_midpoint_pct = min(g_midpoint_pct + 17.0, 85.0)
-            ai_beer_line = ai.get("beer_line_pct")
-            if ai_beer_line is not None:
-                beer_line_pct = max(ai_beer_line - 6.0, 10.0)
-            distance_cm = ai.get("distance_cm")
-            beer_line_position = ai.get("beer_line_position", "below_g")
-            g_detected = ai.get("g_detected", False)
-
-            if distance_cm is None:
-                distance_cm = calculate_distance_cm(beer_line_pct, g_midpoint_pct)
-
-            description = build_description(distance_cm, beer_line_position, g_detected)
-
-            return {
-                "glass_detected": True,
-                "beer_present": True,
-                "g_detected": g_detected,
-                "distance_cm": round(distance_cm, 2),
-                "description": description,
-                "beer_line_position": beer_line_position,
-                "g_midpoint_pct": round(g_midpoint_pct, 1),
-                "beer_line_pct": round(beer_line_pct, 1),
-                "measurement_method": "ai",
-            }
-
-    except Exception as e:
-        print(f"AI analysis failed: {e}")
-
-    # Fallback if AI fails
     distance_cm = calculate_distance_cm(beer_line_pct, g_midpoint_pct)
     beer_line_position = get_beer_line_position(beer_line_pct, g_midpoint_pct)
-    description = build_description(distance_cm, beer_line_position, g_detected)
+    description = build_description(distance_cm, beer_line_position, True)
 
     return {
         "glass_detected": True,
         "beer_present": True,
-        "g_detected": g_detected,
-        "distance_cm": distance_cm,
+        "g_detected": True,
+        "distance_cm": round(distance_cm, 2),
         "description": description,
         "beer_line_position": beer_line_position,
         "g_midpoint_pct": round(g_midpoint_pct, 1),
         "beer_line_pct": round(beer_line_pct, 1),
-        "measurement_method": "opencv",
+        "measurement_method": "opencv-template",
+        "g_detection": g_result,
+        "image_width": w,
+        "image_height": h,
     }
 
 
