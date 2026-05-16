@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sqlite3
 import secrets
@@ -645,36 +646,41 @@ def find_glass_roi(img):
     return best
 
 
-def detect_beer_line(img, roi=None):
+def detect_beer_line(img, roi=None, g_bbox=None):
     h, w = img.shape[:2]
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-    # Dark beer mask (the Guinness body)
     dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 80))
 
-    # Scan rows from top down, find where dark pixels first become dominant
     scan_x1 = int(w * 0.25)
     scan_x2 = int(w * 0.75)
+
+    # Start scanning BELOW the G text to skip the letters
+    # If we know where the G is, start 20% below it
+    if g_bbox:
+        g_bottom = g_bbox["y"] + g_bbox["h"]
+        scan_start = g_bottom + int(h * 0.05)  # 5% padding below G
+    else:
+        scan_start = int(h * 0.3)  # fallback
+
+    scan_end = int(h * 0.95)
 
     best_row = None
     best_transition = 0
 
-    for y in range(int(h * 0.2), int(h * 0.9)):
+    for y in range(scan_start, scan_end):
         row = dark_mask[y, scan_x1:scan_x2]
         dark_ratio = np.sum(row > 0) / len(row)
 
         row_above = dark_mask[max(0, y - 10), scan_x1:scan_x2]
         dark_above = np.sum(row_above > 0) / len(row_above)
 
-        # Find the sharpest transition from light (cream) to dark (beer)
         transition = dark_ratio - dark_above
         if transition > best_transition and dark_ratio > 0.4:
             best_transition = transition
             best_row = y
 
     if best_row is None:
-        # Fallback: find first row where dark pixels dominate
-        for y in range(int(h * 0.2), int(h * 0.9)):
+        for y in range(scan_start, scan_end):
             row = dark_mask[y, scan_x1:scan_x2]
             if np.sum(row > 0) / len(row) > 0.5:
                 best_row = y
@@ -728,11 +734,18 @@ def get_g_template():
             return None
         _g_template_cache = tmpl
     return _g_template_cache
+    
+    # Sort left-to-right, take the leftmost candidate (G is first letter)
+    candidates.sort(key=lambda c: c[0])
+    x, y, cw, ch = candidates[0]
+    
+    # Adjust y back to full image coordinates
+    abs_y = search_top + y + ch // 2
+    abs_x = x + cw // 2
+    
+    return {"x": abs_x, "y": abs_y}
 
 def detect_guinness_g(image_bgr: np.ndarray, img_bytes: bytes) -> Optional[dict]:
-    """
-    Uses GPT-4o to locate the Guinness G lettermark and return a bounding box.
-    """
     if client is None:
         return None
 
@@ -740,57 +753,37 @@ def detect_guinness_g(image_bgr: np.ndarray, img_bytes: bytes) -> Optional[dict]
 
     try:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
-
-        prompt = f"""This is a photo of a Guinness pint glass ({w}px wide by {h}px tall).
-
-Find the white letter 'G' — the first letter of the word GUINNESS printed on the glass.
-
-Return ONLY valid JSON with a tight bounding box around just the G letterform in pixel coordinates:
-{{
-  "found": true,
-  "x": 120,
-  "y": 340,
-  "w": 80,
-  "h": 95
-}}
-
-x,y = top-left corner of the G. w,h = width and height in pixels.
-Make the box tight — just the G letter itself, not surrounding text.
-If you cannot find the G, return: {{"found": false}}
-Return JSON only, no other text."""
-
         response = client.chat.completions.create(
             model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                ]
-            }],
-            max_tokens=100,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": (
+                    f"This image is {w}x{h}px. Using percentages where 0%=top-left and 100%=bottom-right: "
+                    f"1. The glass has the word GUINNESS in large bold white text on its dark lower section. "
+                    f"Find that text and return the center of the G (first letter, leftmost) as g_x_pct and g_y_pct. "
+                    f"This G is well below the foam — it is on the dark stout, not in the white foam zone. "
+                    f"Do NOT return coordinates in the foam/white area. "
+                    f'Return ONLY JSON: {{"g_x_pct": <float>, "g_y_pct": <float>, "line_y_pct": <float>}}'
+                )},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+            ]}],
+        max_tokens=80,
         )
-
         text = response.choices[0].message.content
-        match = re.search(r'\{.*\}', text, re.DOTALL)
+        print(f"GPT raw response: {text}")
+        match = re.search(r'\{.*?\}', text, re.DOTALL)
         if not match:
             return None
 
         ai = json.loads(match.group())
-        if not ai.get("found"):
-            return None
-
-        x = int(ai["x"])
-        y = int(ai["y"])
-        bw = int(ai["w"])
-        bh = int(ai["h"])
-        cx = x + bw // 2
-        cy = y + bh // 2
+        g_center_x = int(ai["g_x_pct"] / 100 * w)
+        g_center_y = int(ai["g_y_pct"] / 100 * h)
+        beer_line_y = int(ai["line_y_pct"] / 100 * h)
 
         return {
-            "bbox": {"x": x, "y": y, "w": bw, "h": bh},
-            "center": {"x": cx, "y": cy},
-            "confidence": 1.0,  # AI doesn't return a score, treat as high confidence
+            "bbox": {"x": int(ai["g_x_pct"] / 100 * w) - 60, "y": g_center_y - 50, "w": 80, "h": 100},
+            "center": {"x": g_center_x, "y": g_center_y},
+            "beer_line_y": beer_line_y,
+            "confidence": 1.0,
         }
 
     except Exception as e:
@@ -847,14 +840,12 @@ async def analyze(file: UploadFile = File(...)):
                 "image_width": w, "image_height": h}
 
     # ── Detect beer line ──
-    roi = find_glass_roi(img)
-    beer_line_pct, _, _ = detect_beer_line(img, roi)
-    if beer_line_pct is None:
-        beer_line_pct = 70.0
+    beer_line_y = g_result.get("beer_line_y", int(h * 0.5))
+    beer_line_pct = (1 - beer_line_y / h) * 100
 
     # ── Calculate split using G center from template matching ──
     g_center_y = g_result["center"]["y"]
-    g_midpoint_pct = (g_center_y / h) * 100
+    g_midpoint_pct = (1 - g_center_y / h) * 100
 
     distance_cm = calculate_distance_cm(beer_line_pct, g_midpoint_pct)
     beer_line_position = get_beer_line_position(beer_line_pct, g_midpoint_pct)
@@ -895,3 +886,51 @@ async def global_stats():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+# ── CHECK FILTER ────────────────────────────────────────────────────────────────────
+
+@app.post("/debug-image")
+async def debug_image(file: UploadFile = File(...)):
+    img_bytes = await file.read()
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return {"error": "Could not read image"}
+
+    h, w = img.shape[:2]
+
+    g_result = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: detect_guinness_g(img, img_bytes)
+    )
+
+    beer_row = int(g_result["beer_line_y"]) if g_result else int(h * 0.5)
+    beer_line_pct = beer_row / h * 100
+
+    cv2.line(img, (0, beer_row), (w, beer_row), (255, 0, 0), 2)
+    cv2.putText(img, f"Beer {beer_line_pct:.1f}%", (10, beer_row - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+    if g_result:
+        gx = g_result["bbox"]["x"]
+        gy = g_result["bbox"]["y"]
+        gw = g_result["bbox"]["w"]
+        gh = g_result["bbox"]["h"]
+        cv2.rectangle(img, (gx, gy), (gx + gw, gy + gh), (0, 165, 255), 2)
+
+    import time
+    ts = int(time.time())
+    ann_path = f"uploads/debug_annotated_{ts}.jpg"
+    mask_path = f"uploads/debug_dark_mask_{ts}.jpg"
+    cv2.imwrite(ann_path, img)
+
+    gray = cv2.cvtColor(cv2.imdecode(nparr, cv2.IMREAD_COLOR), cv2.COLOR_BGR2GRAY)
+    _, dark_mask = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+    cv2.imwrite(mask_path, dark_mask)
+
+    return {
+        "beer_line_pct": beer_line_pct,
+        "g_detected": g_result is not None,
+        "annotated": f"/uploads/debug_annotated_{ts}.jpg",
+        "dark_mask": f"/uploads/debug_dark_mask_{ts}.jpg",
+    }
