@@ -12,3 +12,4 @@ easyocreasyocr
 easyocr
 easyocr
 easyocr
+easyocr
