@@ -3,13 +3,9 @@ uvicorn
 python-multipart
 openai
 httpx
-numpy==2.0.2
+numpy==1.26.4
 opencv-python-headless==4.13.0.92
 bcrypt
 PyJWT
 email-validator
-easyocreasyocr
-easyocr
-easyocr
-easyocr
 easyocr
