@@ -18,6 +18,7 @@ import bcrypt
 import jwt
 import numpy as np
 import cv2
+import easyocr  
 from typing import Optional
 from openai import OpenAI
 _openai_key = os.environ.get("OPENAI_API_KEY")
@@ -25,6 +26,7 @@ client = OpenAI(api_key=_openai_key) if _openai_key else None
 print(f"OpenAI key loaded: {bool(_openai_key)}")
 
 app = FastAPI()
+reader = easyocr.Reader(['en'], gpu=False)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -746,48 +748,73 @@ def get_g_template():
     return {"x": abs_x, "y": abs_y}
 
 def detect_guinness_g(image_bgr: np.ndarray, img_bytes: bytes) -> Optional[dict]:
-    if client is None:
-        return None
-
     h, w = image_bgr.shape[:2]
 
     try:
-        b64 = base64.b64encode(img_bytes).decode("utf-8")
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": (
-                    f"This image is {w}x{h}px. Using percentages where 0%=top-left and 100%=bottom-right: "
-                    f"1. The glass has the word GUINNESS in large bold white text on its dark lower section. "
-                    f"Find that text and return the center of the G (first letter, leftmost) as g_x_pct and g_y_pct. "
-                    f"This G is well below the foam — it is on the dark stout, not in the white foam zone. "
-                    f"Do NOT return coordinates in the foam/white area. "
-                    f'Return ONLY JSON: {{"g_x_pct": <float>, "g_y_pct": <float>, "line_y_pct": <float>}}'
-                )},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-            ]}],
-        max_tokens=80,
-        )
-        text = response.choices[0].message.content
-        print(f"GPT raw response: {text}")
-        match = re.search(r'\{.*?\}', text, re.DOTALL)
-        if not match:
-            return None
+        # Search in the lower 30-75% of the image where GUINNESS text lives
+        search_top = int(h * 0.30)
+        search_bot = int(h * 0.75)
+        crop = image_bgr[search_top:search_bot, :]
 
-        ai = json.loads(match.group())
-        g_center_x = int(ai["g_x_pct"] / 100 * w)
-        g_center_y = int(ai["g_y_pct"] / 100 * h)
-        beer_line_y = int(ai["line_y_pct"] / 100 * h)
+        results = reader.readtext(crop)
+        print(f"EasyOCR results: {[(text, round(conf,2)) for _, text, conf in results]}")
+
+        guinness_bbox = None
+        for (bbox, text, conf) in results:
+            if 'GUINNESS' in text.upper() and conf > 0.3:
+                guinness_bbox = bbox
+                break
+
+        if guinness_bbox is None:
+            # Fallback to GPT if EasyOCR misses it
+            if client is None:
+                return None
+            b64 = base64.b64encode(img_bytes).decode("utf-8")
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": (
+                        f"This image is {w}x{h}px. "
+                        f"Find the word GUINNESS in white bold text on the dark stout section. "
+                        f"Return the center of the G (first letter) as g_x_pct, g_y_pct. "
+                        f"Also return the beer line as line_y_pct. "
+                        f'Return ONLY JSON: {{"g_x_pct": <float>, "g_y_pct": <float>, "line_y_pct": <float>}}'
+                    )},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                ]}],
+                max_tokens=80,
+            )
+            text_resp = response.choices[0].message.content
+            print(f"GPT fallback response: {text_resp}")
+            match = re.search(r'\{.*?\}', text_resp, re.DOTALL)
+            if not match:
+                return None
+            ai = json.loads(match.group())
+            g_center_x = int(ai["g_x_pct"] / 100 * w)
+            g_center_y = int(ai["g_y_pct"] / 100 * h)
+            beer_line_y = int(ai["line_y_pct"] / 100 * h)
+        else:
+            # Convert crop-relative bbox back to full image coordinates
+            pts = np.array(guinness_bbox, dtype=np.int32)
+            # pts[0]=top-left, pts[1]=top-right, pts[2]=bottom-right, pts[3]=bottom-left
+            text_top    = pts[0][1] + search_top
+            text_bottom = pts[2][1] + search_top
+            text_left   = pts[0][0]
+            text_right  = pts[1][0]
+
+            g_center_x = int((text_left + text_right) / 2)  # center of full word — x doesn't affect score
+            g_center_y = int((text_top + text_bottom) / 2)   # vertical midpoint — this is what matters
+            beer_line_y = g_center_y  # will be refined by detect_beer_line
 
         return {
-            "bbox": {"x": int(ai["g_x_pct"] / 100 * w) - 60, "y": g_center_y - 50, "w": 80, "h": 100},
+            "bbox": {"x": g_center_x - 60, "y": g_center_y - 50, "w": 80, "h": 100},
             "center": {"x": g_center_x, "y": g_center_y},
             "beer_line_y": beer_line_y,
             "confidence": 1.0,
         }
 
     except Exception as e:
-        print(f"AI G detection failed: {e}")
+        print(f"detect_guinness_g failed: {e}")
         return None
 
 # ── IMAGE ANALYSIS ENDPOINT ───────────────────────────────────────────────────
@@ -840,8 +867,15 @@ async def analyze(file: UploadFile = File(...)):
                 "image_width": w, "image_height": h}
 
     # ── Detect beer line ──
-    beer_line_y = g_result.get("beer_line_y", int(h * 0.5))
-    beer_line_pct = (1 - beer_line_y / h) * 100
+    g_bbox = g_result["bbox"]
+    _, beer_row, _ = detect_beer_line(img, g_bbox=g_bbox)
+    if beer_row is None:
+        return {"glass_detected": True, "beer_present": True, "g_detected": False,
+                "distance_cm": None, "description": "Could not detect beer line. Try a closer angle.",
+                "beer_line_position": None, "g_midpoint_pct": None, "beer_line_pct": None,
+                "measurement_method": "opencv", "g_detection": None,
+                "image_width": w, "image_height": h}
+    beer_line_pct = (1 - beer_row / h) * 100
 
     # ── Calculate split using G center from template matching ──
     g_center_y = g_result["center"]["y"]
@@ -852,19 +886,30 @@ async def analyze(file: UploadFile = File(...)):
     description = build_description(distance_cm, beer_line_position, True)
 
     return {
-        "glass_detected": True,
-        "beer_present": True,
-        "g_detected": True,
-        "distance_cm": round(distance_cm, 2),
-        "description": description,
-        "beer_line_position": beer_line_position,
-        "g_midpoint_pct": round(g_midpoint_pct, 1),
-        "beer_line_pct": round(beer_line_pct, 1),
-        "measurement_method": "opencv-template",
-        "g_detection": g_result,
-        "image_width": w,
-        "image_height": h,
+    "glass_detected": True,
+    "beer_present": True,
+    "g_detected": True,
+    "distance_cm": round(distance_cm, 2),
+    "description": description,
+    "beer_line_position": beer_line_position,
+    "g_midpoint_pct": round(g_midpoint_pct, 1),
+    "beer_line_pct": round(beer_line_pct, 1),
+    "measurement_method": "opencv-template",
+    "g_detection": g_result,
+    "image_width": w,
+    "image_height": h,
+    # ── overlay data for the app ──
+    "overlay": {
+        "guinness_box": {
+            "x": g_result["bbox"]["x"],
+            "y": g_result["bbox"]["y"],
+            "w": g_result["bbox"]["w"],
+            "h": g_result["bbox"]["h"],
+        },
+        "g_center_y_pct": round(g_midpoint_pct, 1),   # % from bottom
+        "beer_line_pct": round(beer_line_pct, 1),       # % from bottom
     }
+}
 
 
 # ── GLOBAL STATS ──────────────────────────────────────────────────────────────
@@ -900,11 +945,43 @@ async def debug_image(file: UploadFile = File(...)):
 
     h, w = img.shape[:2]
 
+    # ── EasyOCR visualization ──
+    search_top = int(h * 0.30)
+    search_bot = int(h * 0.75)
+    crop = img[search_top:search_bot, :]
+    ocr_results = reader.readtext(crop)
+    print(f"EasyOCR results: {[(text, round(conf,2)) for _, text, conf in ocr_results]}")
+
+    ocr_vis = img.copy()
+    for (bbox, text, conf) in ocr_results:
+        pts = np.array(bbox, dtype=np.int32)
+        # shift pts back to full image coords
+        pts[:, 1] += search_top
+        color = (0, 255, 0) if 'GUINNESS' in text.upper() else (0, 165, 255)
+        cv2.polylines(ocr_vis, [pts], True, color, 2)
+        cv2.putText(ocr_vis, f"{text} ({conf:.2f})",
+                    (pts[0][0], pts[0][1] - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    # Draw search region boundaries
+    cv2.line(ocr_vis, (0, search_top), (w, search_top), (255, 255, 0), 1)
+    cv2.line(ocr_vis, (0, search_bot), (w, search_bot), (255, 255, 0), 1)
+    cv2.putText(ocr_vis, "OCR search zone", (10, search_top + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+    # ── G detection + beer line ──
     g_result = await asyncio.get_event_loop().run_in_executor(
         None, lambda: detect_guinness_g(img, img_bytes)
     )
 
-    beer_row = int(g_result["beer_line_y"]) if g_result else int(h * 0.5)
+    if g_result:
+        g_bbox = g_result["bbox"]
+        _, beer_row, _ = detect_beer_line(img, g_bbox=g_bbox)
+        if beer_row is None:
+            beer_row = int(h * 0.5)
+    else:
+        beer_row = int(h * 0.5)
+
     beer_line_pct = beer_row / h * 100
 
     cv2.line(img, (0, beer_row), (w, beer_row), (255, 0, 0), 2)
@@ -921,8 +998,11 @@ async def debug_image(file: UploadFile = File(...)):
     import time
     ts = int(time.time())
     ann_path = f"uploads/debug_annotated_{ts}.jpg"
+    ocr_path = f"uploads/debug_ocr_{ts}.jpg"
     mask_path = f"uploads/debug_dark_mask_{ts}.jpg"
+
     cv2.imwrite(ann_path, img)
+    cv2.imwrite(ocr_path, ocr_vis)
 
     gray = cv2.cvtColor(cv2.imdecode(nparr, cv2.IMREAD_COLOR), cv2.COLOR_BGR2GRAY)
     _, dark_mask = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
@@ -931,6 +1011,8 @@ async def debug_image(file: UploadFile = File(...)):
     return {
         "beer_line_pct": beer_line_pct,
         "g_detected": g_result is not None,
+        "ocr_results": [(text, round(conf, 2)) for _, text, conf in ocr_results],
         "annotated": f"/uploads/debug_annotated_{ts}.jpg",
+        "ocr_visualization": f"/uploads/debug_ocr_{ts}.jpg",
         "dark_mask": f"/uploads/debug_dark_mask_{ts}.jpg",
     }
