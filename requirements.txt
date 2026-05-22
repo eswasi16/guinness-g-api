@@ -10,3 +10,4 @@ PyJWT
 email-validator
 easyocreasyocr
 easyocr
+easyocr
