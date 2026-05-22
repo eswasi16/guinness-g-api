@@ -11,3 +11,4 @@ email-validator
 easyocreasyocr
 easyocr
 easyocr
+easyocr
