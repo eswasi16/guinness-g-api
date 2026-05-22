@@ -9,3 +9,4 @@ bcrypt
 PyJWT
 email-validator
 easyocreasyocr
+easyocr
