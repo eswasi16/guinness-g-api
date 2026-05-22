@@ -8,3 +8,4 @@ opencv-python-headless==4.13.0.92
 bcrypt
 PyJWT
 email-validator
+easyocreasyocr
