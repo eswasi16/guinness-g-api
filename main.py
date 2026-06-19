@@ -3,9 +3,6 @@ import os
 import sqlite3
 import secrets
 import smtplib
-import base64
-import json
-import re
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -20,11 +17,7 @@ import numpy as np
 import cv2
 import easyocr  
 from typing import Optional
-from openai import OpenAI
-_openai_key = os.environ.get("OPENAI_API_KEY")
-client = OpenAI(api_key=_openai_key) if _openai_key else None
-print(f"OpenAI key loaded: {bool(_openai_key)}")
-
+from difflib import SequenceMatcher
 app = FastAPI()
 reader = easyocr.Reader(['en'], gpu=False)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -653,38 +646,42 @@ def detect_beer_line(img, roi=None, g_bbox=None):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 80))
 
-    scan_x1 = int(w * 0.25)
-    scan_x2 = int(w * 0.75)
-
-    # Start scanning BELOW the G text to skip the letters
-    # If we know where the G is, start 20% below it
     if g_bbox:
-        g_bottom = g_bbox["y"] + g_bbox["h"]
-        scan_start = g_bottom + int(h * 0.05)  # 5% padding below G
-    else:
-        scan_start = int(h * 0.3)  # fallback
+        # Horizontally: use the G centre ± the estimated word width to stay in the glass.
+        g_cx           = g_bbox["x"] + g_bbox["w"] // 2
+        word_width_est = g_bbox["w"] * 7
+        half_band      = max(int(word_width_est * 0.55), int(w * 0.12))
+        scan_x1 = max(0, g_cx - half_band)
+        scan_x2 = min(w, g_cx + half_band)
 
-    scan_end = int(h * 0.95)
+        # Scan UPWARD from the G top — we start inside the stout and walk up until
+        # we exit into the foam. This avoids any shelf/background above the glass.
+        scan_start = g_bbox["y"] - int(h * 0.01)   # just above G top
+        scan_floor = int(h * 0.03)                  # don't go into the very top of frame
+    else:
+        scan_x1, scan_x2 = int(w * 0.25), int(w * 0.75)
+        scan_start = int(h * 0.80)
+        scan_floor = int(h * 0.05)
 
     best_row = None
-    best_transition = 0
 
-    for y in range(scan_start, scan_end):
+    # Walk upward from the G: the rows near the G are dark stout. As we move up
+    # we eventually cross into the foam — that crossing IS the beer line.
+    # Stop at the first row where dark ratio drops below the threshold so we
+    # never overshoot into the shelf or background above.
+    for y in range(scan_start, scan_floor, -1):
         row = dark_mask[y, scan_x1:scan_x2]
-        dark_ratio = np.sum(row > 0) / len(row)
+        dark_ratio = np.sum(row > 0) / max(len(row), 1)
+        if dark_ratio < 0.30:
+            # We just crossed out of the stout — the previous (darker) row is the line
+            best_row = min(y + 8, scan_start)
+            break
 
-        row_above = dark_mask[max(0, y - 10), scan_x1:scan_x2]
-        dark_above = np.sum(row_above > 0) / len(row_above)
-
-        transition = dark_ratio - dark_above
-        if transition > best_transition and dark_ratio > 0.4:
-            best_transition = transition
-            best_row = y
-
+    # Fallback: deepest row still dark when scanning upward
     if best_row is None:
-        for y in range(scan_start, scan_end):
+        for y in range(scan_start, scan_floor, -1):
             row = dark_mask[y, scan_x1:scan_x2]
-            if np.sum(row > 0) / len(row) > 0.5:
+            if np.sum(row > 0) / max(len(row), 1) > 0.45:
                 best_row = y
                 break
 
@@ -747,69 +744,79 @@ def get_g_template():
     
     return {"x": abs_x, "y": abs_y}
 
-def detect_guinness_g(image_bgr: np.ndarray, img_bytes: bytes) -> Optional[dict]:
+def _looks_like_guinness(text: str) -> bool:
+    clean = text.strip().upper().replace(' ', '')
+    if 'GUINNESS' in clean:
+        return True
+    # Accept OCR near-misses (e.g. "GUININESD", "GULVNES")
+    ratio = SequenceMatcher(None, clean, 'GUINNESS').ratio()
+    return ratio >= 0.65
+
+
+def _enhance_for_ocr(crop_bgr: np.ndarray) -> np.ndarray:
+    """Boost local contrast so white-on-dark text reads more reliably."""
+    lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    enhanced = cv2.merge([l, a, b])
+    return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+
+
+def detect_guinness_g(image_bgr: np.ndarray) -> Optional[dict]:
     h, w = image_bgr.shape[:2]
 
     try:
-        # Search in the lower 30-75% of the image where GUINNESS text lives
         search_top = int(h * 0.30)
         search_bot = int(h * 0.75)
-        crop = image_bgr[search_top:search_bot, :]
+        crop = _enhance_for_ocr(image_bgr[search_top:search_bot, :])
 
         results = reader.readtext(crop)
         print(f"EasyOCR results: {[(text, round(conf,2)) for _, text, conf in results]}")
 
-        guinness_bbox = None
+        g_pts = None
+
+        # Pass 1: standalone "G" character
         for (bbox, text, conf) in results:
-            if 'GUINNESS' in text.upper() and conf > 0.3:
-                guinness_bbox = bbox
+            if text.strip().upper() == 'G' and conf > 0.2:
+                g_pts = np.array(bbox, dtype=np.int32)
+                print(f"Found standalone G at conf {conf:.2f}")
                 break
 
-        if guinness_bbox is None:
-            # Fallback to GPT if EasyOCR misses it
-            if client is None:
-                return None
-            b64 = base64.b64encode(img_bytes).decode("utf-8")
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": (
-                        f"This image is {w}x{h}px. "
-                        f"Find the word GUINNESS in white bold text on the dark stout section. "
-                        f"Return the center of the G (first letter) as g_x_pct, g_y_pct. "
-                        f"Also return the beer line as line_y_pct. "
-                        f'Return ONLY JSON: {{"g_x_pct": <float>, "g_y_pct": <float>, "line_y_pct": <float>}}'
-                    )},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                ]}],
-                max_tokens=80,
-            )
-            text_resp = response.choices[0].message.content
-            print(f"GPT fallback response: {text_resp}")
-            match = re.search(r'\{.*?\}', text_resp, re.DOTALL)
-            if not match:
-                return None
-            ai = json.loads(match.group())
-            g_center_x = int(ai["g_x_pct"] / 100 * w)
-            g_center_y = int(ai["g_y_pct"] / 100 * h)
-            beer_line_y = int(ai["line_y_pct"] / 100 * h)
-        else:
-            # Convert crop-relative bbox back to full image coordinates
-            pts = np.array(guinness_bbox, dtype=np.int32)
-            # pts[0]=top-left, pts[1]=top-right, pts[2]=bottom-right, pts[3]=bottom-left
-            text_top    = pts[0][1] + search_top
-            text_bottom = pts[2][1] + search_top
-            text_left   = pts[0][0]
-            text_right  = pts[1][0]
+        # Pass 2: full/partial GUINNESS word (fuzzy), slice to first character
+        if g_pts is None:
+            for (bbox, text, conf) in results:
+                if conf > 0.1 and _looks_like_guinness(text):
+                    clean = text.strip().upper().replace(' ', '')
+                    pts = np.array(bbox, dtype=np.int32)
+                    word_width = pts[1][0] - pts[0][0]
+                    char_width = max(1, int(word_width / len(clean)))
+                    g_right = pts[0][0] + char_width
+                    g_pts = np.array([
+                        [pts[0][0], pts[0][1]],
+                        [g_right,   pts[1][1]],
+                        [g_right,   pts[2][1]],
+                        [pts[0][0], pts[3][1]],
+                    ], dtype=np.int32)
+                    print(f"Estimated G from '{text}' (sim={SequenceMatcher(None, clean, 'GUINNESS').ratio():.2f}) at conf {conf:.2f}")
+                    break
 
-            g_center_x = int((text_left + text_right) / 2)  # center of full word — x doesn't affect score
-            g_center_y = int((text_top + text_bottom) / 2)   # vertical midpoint — this is what matters
-            beer_line_y = g_center_y  # will be refined by detect_beer_line
+        if g_pts is None:
+            return None
+
+        # Convert crop-relative coords to full-image coords
+        box_left   = int(g_pts[0][0])
+        box_right  = int(g_pts[1][0])
+        box_top    = int(g_pts[0][1]) + search_top
+        box_bottom = int(g_pts[2][1]) + search_top
+
+        g_center_x = (box_left + box_right) // 2
+        g_center_y = (box_top + box_bottom) // 2
 
         return {
-            "bbox": {"x": g_center_x - 60, "y": g_center_y - 50, "w": 80, "h": 100},
+            "bbox": {"x": box_left, "y": box_top, "w": box_right - box_left, "h": box_bottom - box_top},
             "center": {"x": g_center_x, "y": g_center_y},
-            "beer_line_y": beer_line_y,
+            "beer_line_y": g_center_y,
             "confidence": 1.0,
         }
 
@@ -856,8 +863,8 @@ async def analyze(file: UploadFile = File(...)):
                 "measurement_method": "opencv", "g_detection": None,
                 "image_width": w, "image_height": h}
 
-    # ── Detect G via template matching ──
-    g_result = detect_guinness_g(img, img_bytes)
+    # ── Detect G ──
+    g_result = detect_guinness_g(img)
 
     if g_result is None:
         return {"glass_detected": True, "beer_present": True, "g_detected": False,
@@ -971,7 +978,7 @@ async def debug_image(file: UploadFile = File(...)):
 
     # ── G detection + beer line ──
     g_result = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: detect_guinness_g(img, img_bytes)
+        None, lambda: detect_guinness_g(img)
     )
 
     if g_result:
