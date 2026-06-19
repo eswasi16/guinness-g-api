@@ -748,13 +748,11 @@ def _looks_like_guinness(text: str) -> bool:
     clean = text.strip().upper().replace(' ', '')
     if 'GUINNESS' in clean:
         return True
-    # Accept OCR near-misses (e.g. "GUININESD", "GULVNES")
     ratio = SequenceMatcher(None, clean, 'GUINNESS').ratio()
     return ratio >= 0.65
 
 
 def _enhance_for_ocr(crop_bgr: np.ndarray) -> np.ndarray:
-    """Boost local contrast so white-on-dark text reads more reliably."""
     lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -763,58 +761,105 @@ def _enhance_for_ocr(crop_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
 
+_g_template_cache: Optional[np.ndarray] = None
+
+def _get_g_template() -> Optional[np.ndarray]:
+    global _g_template_cache
+    if _g_template_cache is None:
+        tmpl = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
+        if tmpl is not None:
+            _g_template_cache = tmpl
+    return _g_template_cache
+
+
+def _template_match_g(image_bgr: np.ndarray) -> Optional[dict]:
+    """Primary G detection via multi-scale template matching."""
+    tmpl = _get_g_template()
+    if tmpl is None:
+        return None
+
+    h, w = image_bgr.shape[:2]
+    th, tw = tmpl.shape[:2]
+
+    search_top = int(h * 0.25)
+    search_bot = int(h * 0.80)
+    crop_gray = cv2.cvtColor(image_bgr[search_top:search_bot, :], cv2.COLOR_BGR2GRAY)
+
+    best_val, best_loc, best_size = -1, None, None
+
+    for scale in np.linspace(0.2, 2.5, 50):
+        rw = max(1, int(tw * scale))
+        rh = max(1, int(th * scale))
+        if rw >= crop_gray.shape[1] or rh >= crop_gray.shape[0]:
+            continue
+        resized = cv2.resize(tmpl, (rw, rh))
+        result = cv2.matchTemplate(crop_gray, resized, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        if max_val > best_val:
+            best_val, best_loc, best_size = max_val, max_loc, (rw, rh)
+
+    if best_val < 0.55 or best_loc is None:
+        print(f"Template match score too low: {best_val:.3f}")
+        return None
+
+    x, y = best_loc
+    rw, rh = best_size
+    abs_y = y + search_top
+    print(f"Template match: score={best_val:.3f} bbox=({x},{abs_y},{rw},{rh})")
+
+    return {
+        "box_left": x, "box_top": abs_y,
+        "box_right": x + rw, "box_bottom": abs_y + rh,
+    }
+
+
+def _ocr_fallback_g(image_bgr: np.ndarray) -> Optional[dict]:
+    """Fallback G detection via EasyOCR fuzzy word match."""
+    h, w = image_bgr.shape[:2]
+    search_top = int(h * 0.30)
+    search_bot = int(h * 0.75)
+    crop = _enhance_for_ocr(image_bgr[search_top:search_bot, :])
+    results = reader.readtext(crop)
+    print(f"EasyOCR fallback: {[(text, round(conf,2)) for _, text, conf in results]}")
+
+    for (bbox, text, conf) in results:
+        if text.strip().upper() == 'G' and conf > 0.2:
+            pts = np.array(bbox, dtype=np.int32)
+            min_x = int(min(p[0] for p in pts))
+            max_x = int(max(p[0] for p in pts))
+            min_y = int(min(p[1] for p in pts)) + search_top
+            max_y = int(max(p[1] for p in pts)) + search_top
+            return {"box_left": min_x, "box_top": min_y, "box_right": max_x, "box_bottom": max_y}
+
+    for (bbox, text, conf) in results:
+        if conf > 0.1 and _looks_like_guinness(text):
+            clean = text.strip().upper().replace(' ', '')
+            pts = np.array(bbox, dtype=np.int32)
+            min_x = int(min(p[0] for p in pts))
+            max_x = int(max(p[0] for p in pts))
+            min_y = int(min(p[1] for p in pts)) + search_top
+            max_y = int(max(p[1] for p in pts)) + search_top
+            word_width = max_x - min_x
+            char_width = max(1, int(word_width / max(len(clean), 1) * 1.3))
+            return {"box_left": min_x, "box_top": min_y, "box_right": min_x + char_width, "box_bottom": max_y}
+
+    return None
+
+
 def detect_guinness_g(image_bgr: np.ndarray) -> Optional[dict]:
     h, w = image_bgr.shape[:2]
 
     try:
-        search_top = int(h * 0.30)
-        search_bot = int(h * 0.75)
-        crop = _enhance_for_ocr(image_bgr[search_top:search_bot, :])
-
-        results = reader.readtext(crop)
-        print(f"EasyOCR results: {[(text, round(conf,2)) for _, text, conf in results]}")
-
-        g_pts = None
-
-        # Pass 1: standalone "G" character
-        for (bbox, text, conf) in results:
-            if text.strip().upper() == 'G' and conf > 0.2:
-                g_pts = np.array(bbox, dtype=np.int32)
-                print(f"Found standalone G at conf {conf:.2f}")
-                break
-
-        # Pass 2: full/partial GUINNESS word (fuzzy), slice to first character
-        if g_pts is None:
-            for (bbox, text, conf) in results:
-                if conf > 0.1 and _looks_like_guinness(text):
-                    clean = text.strip().upper().replace(' ', '')
-                    pts = np.array(bbox, dtype=np.int32)
-                    # Use min/max of all 4 corners — EasyOCR polygons can be slanted
-                    min_x = int(min(p[0] for p in pts))
-                    max_x = int(max(p[0] for p in pts))
-                    min_y = int(min(p[1] for p in pts))
-                    max_y = int(max(p[1] for p in pts))
-                    word_width = max_x - min_x
-                    # G is always the leftmost char; it's wide (~1.3× avg) in this serif font
-                    char_width = max(1, int(word_width / max(len(clean), 1) * 1.3))
-                    g_right = min_x + char_width
-                    g_pts = np.array([
-                        [min_x,   min_y],
-                        [g_right, min_y],
-                        [g_right, max_y],
-                        [min_x,   max_y],
-                    ], dtype=np.int32)
-                    print(f"Estimated G from '{text}' (sim={SequenceMatcher(None, clean, 'GUINNESS').ratio():.2f}) at conf {conf:.2f}")
-                    break
-
-        if g_pts is None:
+        box = _template_match_g(image_bgr)
+        if box is None:
+            box = _ocr_fallback_g(image_bgr)
+        if box is None:
             return None
 
-        # Convert crop-relative coords to full-image coords
-        box_left   = int(g_pts[0][0])
-        box_right  = int(g_pts[1][0])
-        box_top    = int(g_pts[0][1]) + search_top
-        box_bottom = int(g_pts[2][1]) + search_top
+        box_left   = box["box_left"]
+        box_right  = box["box_right"]
+        box_top    = box["box_top"]
+        box_bottom = box["box_bottom"]
 
         g_center_x = (box_left + box_right) // 2
         g_center_y = (box_top + box_bottom) // 2
