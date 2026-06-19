@@ -789,14 +789,20 @@ def detect_guinness_g(image_bgr: np.ndarray) -> Optional[dict]:
                 if conf > 0.1 and _looks_like_guinness(text):
                     clean = text.strip().upper().replace(' ', '')
                     pts = np.array(bbox, dtype=np.int32)
-                    word_width = pts[1][0] - pts[0][0]
-                    char_width = max(1, int(word_width / len(clean)))
-                    g_right = pts[0][0] + char_width
+                    # Use min/max of all 4 corners — EasyOCR polygons can be slanted
+                    min_x = int(min(p[0] for p in pts))
+                    max_x = int(max(p[0] for p in pts))
+                    min_y = int(min(p[1] for p in pts))
+                    max_y = int(max(p[1] for p in pts))
+                    word_width = max_x - min_x
+                    # G is always the leftmost char; it's wide (~1.3× avg) in this serif font
+                    char_width = max(1, int(word_width / max(len(clean), 1) * 1.3))
+                    g_right = min_x + char_width
                     g_pts = np.array([
-                        [pts[0][0], pts[0][1]],
-                        [g_right,   pts[1][1]],
-                        [g_right,   pts[2][1]],
-                        [pts[0][0], pts[3][1]],
+                        [min_x,   min_y],
+                        [g_right, min_y],
+                        [g_right, max_y],
+                        [min_x,   max_y],
                     ], dtype=np.int32)
                     print(f"Estimated G from '{text}' (sim={SequenceMatcher(None, clean, 'GUINNESS').ratio():.2f}) at conf {conf:.2f}")
                     break
