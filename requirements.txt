@@ -1,10 +1,9 @@
 fastapi
 uvicorn
 python-multipart
-openai
 httpx
-numpy==1.26.4
-opencv-python-headless==4.13.0.92
+numpy
+opencv-python-headless
 bcrypt
 PyJWT
 email-validator
