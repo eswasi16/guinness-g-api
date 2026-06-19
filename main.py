@@ -647,17 +647,18 @@ def detect_beer_line(img, roi=None, g_bbox=None):
     dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 80))
 
     if g_bbox:
-        # Horizontally: use the G centre ± the estimated word width to stay in the glass.
-        g_cx           = g_bbox["x"] + g_bbox["w"] // 2
-        word_width_est = g_bbox["w"] * 7
-        half_band      = max(int(word_width_est * 0.55), int(w * 0.12))
-        scan_x1 = max(0, g_cx - half_band)
-        scan_x2 = min(w, g_cx + half_band)
+        # Scan vertically above the G, but ONLY over the G column.
+        # The harp logo sits in the centre of the foam and has enough dark pixels
+        # to keep dark_ratio high all through the foam — scanning there overshoots
+        # to the shelf. The G column has no harp interference.
+        g_left  = g_bbox["x"]
+        g_right = g_bbox["x"] + g_bbox["w"]
+        pad     = g_bbox["w"]                        # one G-width of padding on each side
+        scan_x1 = max(0, g_left - pad)
+        scan_x2 = min(w, g_right + pad)
 
-        # Scan UPWARD from the G top — we start inside the stout and walk up until
-        # we exit into the foam. This avoids any shelf/background above the glass.
-        scan_start = g_bbox["y"] - int(h * 0.01)   # just above G top
-        scan_floor = int(h * 0.03)                  # don't go into the very top of frame
+        scan_start = g_bbox["y"] - int(h * 0.01)    # just above G top
+        scan_floor = int(h * 0.03)
     else:
         scan_x1, scan_x2 = int(w * 0.25), int(w * 0.75)
         scan_start = int(h * 0.80)
@@ -665,19 +666,30 @@ def detect_beer_line(img, roi=None, g_bbox=None):
 
     best_row = None
 
-    # Walk upward from the G: the rows near the G are dark stout. As we move up
-    # we eventually cross into the foam — that crossing IS the beer line.
-    # Stop at the first row where dark ratio drops below the threshold so we
-    # never overshoot into the shelf or background above.
+    # Walk upward from the G: rows near G are dark stout; foam above is light.
+    # Require SUSTAIN_ROWS consecutive low-dark rows before declaring the crossing
+    # so that individual bright text (e.g. "ESTD 1759") on a dark background
+    # doesn't cause a false early stop.
+    SUSTAIN_ROWS = 18
+    low_streak = 0
+    crossing_bottom = None  # first (lowest) y of the sustained-light run
+
     for y in range(scan_start, scan_floor, -1):
         row = dark_mask[y, scan_x1:scan_x2]
         dark_ratio = np.sum(row > 0) / max(len(row), 1)
         if dark_ratio < 0.30:
-            # We just crossed out of the stout — the previous (darker) row is the line
-            best_row = min(y + 8, scan_start)
-            break
+            if low_streak == 0:
+                crossing_bottom = y
+            low_streak += 1
+            if low_streak >= SUSTAIN_ROWS:
+                # Sustained foam region — stout/foam boundary is at the bottom of the run
+                best_row = min(crossing_bottom + 4, scan_start)
+                break
+        else:
+            low_streak = 0
+            crossing_bottom = None
 
-    # Fallback: deepest row still dark when scanning upward
+    # Fallback: deepest row still clearly dark when scanning upward
     if best_row is None:
         for y in range(scan_start, scan_floor, -1):
             row = dark_mask[y, scan_x1:scan_x2]
