@@ -647,18 +647,20 @@ def detect_beer_line(img, roi=None, g_bbox=None):
     value_ch = hsv[:, :, 2]  # V channel: stout dark (~10-50), foam bright (>100) for any foam colour
 
     if g_bbox:
-        # Scan the G column only — the harp in the glass centre corrupts a wide scan.
         g_left   = g_bbox["x"]
         g_right  = g_bbox["x"] + g_bbox["w"]
         g_top    = g_bbox["y"]
         g_bottom = g_bbox["y"] + g_bbox["h"]
         g_h      = g_bbox["h"]
         pad      = g_bbox["w"]
-        scan_x1  = max(0, g_left - pad)
-        scan_x2  = min(w, g_right + pad)
 
-        # The beer line can be anywhere from one G-height above the G top to
-        # two G-heights below the G bottom (under- or over-poured glass).
+        # Scan the G column (± one G-width). The glass is transparent here so
+        # foam/stout show through clearly. Avoids the harp (glass centre).
+        # We intentionally include the GUINNESS text rows — white letters raise
+        # V slightly but the stout (V≈10) vs foam (V>150) gap is wide enough.
+        scan_x1 = max(0, g_left - pad)
+        scan_x2 = min(w, g_right + pad)
+
         scan_top    = max(0,     g_top    - g_h)
         scan_bottom = min(h - 1, g_bottom + g_h * 2)
     else:
@@ -666,12 +668,9 @@ def detect_beer_line(img, roi=None, g_bbox=None):
         scan_top    = int(h * 0.05)
         scan_bottom = int(h * 0.80)
 
-    # Determine which side of the beer line the G bottom sits on, then scan
-    # in the direction that will cross the boundary.
-    g_bottom_v = float(np.mean(value_ch[
-        min(g_bottom, h - 1),
-        scan_x1:scan_x2
-    ])) if g_bbox else 50.0
+    # Check V well BELOW the G box (deep in the stout, no text interference).
+    check_y = min(h - 1, g_bottom + max(g_h // 2, 20)) if g_bbox else (scan_bottom - 10)
+    g_bottom_v = float(np.mean(value_ch[check_y, scan_x1:scan_x2]))
 
     SUSTAIN = 12
     best_row = None
