@@ -647,16 +647,20 @@ def detect_beer_line(img, roi=None, g_bbox=None):
     value_ch = hsv[:, :, 2]  # V channel: stout is dark (~20-50), foam is bright (>100) regardless of colour
 
     if g_bbox:
-        # Scan only the G column — avoids the harp logo in the glass centre
-        # which has enough dark pixels to corrupt a full-width scan.
-        g_left  = g_bbox["x"]
-        g_right = g_bbox["x"] + g_bbox["w"]
-        pad     = g_bbox["w"]
-        scan_x1 = max(0, g_left - pad)
-        scan_x2 = min(w, g_right + pad)
+        # Scan only the G column — avoids the harp logo in the glass centre.
+        g_left   = g_bbox["x"]
+        g_right  = g_bbox["x"] + g_bbox["w"]
+        g_top    = g_bbox["y"]
+        g_bottom = g_bbox["y"] + g_bbox["h"]
+        pad      = g_bbox["w"]
+        scan_x1  = max(0, g_left - pad)
+        scan_x2  = min(w, g_right + pad)
 
-        scan_start = g_bbox["y"] - int(h * 0.01)
-        scan_floor = int(h * 0.03)
+        # The foam/stout boundary is INSIDE or just above the G bounding box —
+        # the G label straddles the line. Start scanning from BELOW the G (in
+        # the stout) and go upward until we hit a sustained bright region (foam).
+        scan_start = min(h - 1, g_bottom + int(h * 0.02))  # below G, in stout
+        scan_floor = max(0, g_top - g_bbox["h"])            # don't overshoot above glass
     else:
         scan_x1, scan_x2 = int(w * 0.25), int(w * 0.75)
         scan_start = int(h * 0.80)
@@ -664,11 +668,12 @@ def detect_beer_line(img, roi=None, g_bbox=None):
 
     best_row = None
 
-    # Walk upward from the G using mean brightness (V channel).
-    # Stout rows: mean_V low (<70).  Foam rows: mean_V high (>100) — works for
-    # both plain white foam AND iridescent/coloured foam (both are bright).
-    # Require SUSTAIN_ROWS consecutive bright rows to skip over "ESTD 1759" text.
-    SUSTAIN_ROWS = 18
+    # Walk upward (decreasing y) from stout into foam.
+    # Use mean brightness (V channel): stout is always dark (<70), foam is
+    # bright (>100) whether white or iridescent/coloured.
+    # Require SUSTAIN_ROWS consecutive bright rows so text like "ESTD 1759"
+    # doesn't trigger a false crossing.
+    SUSTAIN_ROWS = 12
     bright_streak = 0
     crossing_bottom = None
 
@@ -685,7 +690,7 @@ def detect_beer_line(img, roi=None, g_bbox=None):
             bright_streak = 0
             crossing_bottom = None
 
-    # Fallback: deepest row that is clearly stout (very dark)
+    # Fallback: lowest row that is clearly stout
     if best_row is None:
         for y in range(scan_start, scan_floor, -1):
             mean_v = float(np.mean(value_ch[y, scan_x1:scan_x2]))
