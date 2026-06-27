@@ -644,59 +644,68 @@ def find_glass_roi(img):
 def detect_beer_line(img, roi=None, g_bbox=None):
     h, w = img.shape[:2]
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    value_ch = hsv[:, :, 2]  # V channel: stout is dark (~20-50), foam is bright (>100) regardless of colour
+    value_ch = hsv[:, :, 2]  # V channel: stout dark (~10-50), foam bright (>100) for any foam colour
 
     if g_bbox:
-        # Scan only the G column — avoids the harp logo in the glass centre.
+        # Scan the G column only — the harp in the glass centre corrupts a wide scan.
         g_left   = g_bbox["x"]
         g_right  = g_bbox["x"] + g_bbox["w"]
         g_top    = g_bbox["y"]
         g_bottom = g_bbox["y"] + g_bbox["h"]
+        g_h      = g_bbox["h"]
         pad      = g_bbox["w"]
         scan_x1  = max(0, g_left - pad)
         scan_x2  = min(w, g_right + pad)
 
-        # The foam/stout boundary is INSIDE or just above the G bounding box —
-        # the G label straddles the line. Start scanning from BELOW the G (in
-        # the stout) and go upward until we hit a sustained bright region (foam).
-        scan_start = min(h - 1, g_bottom + int(h * 0.02))  # below G, in stout
-        scan_floor = max(0, g_top - g_bbox["h"])            # don't overshoot above glass
+        # The beer line can be anywhere from one G-height above the G top to
+        # two G-heights below the G bottom (under- or over-poured glass).
+        scan_top    = max(0,     g_top    - g_h)
+        scan_bottom = min(h - 1, g_bottom + g_h * 2)
     else:
         scan_x1, scan_x2 = int(w * 0.25), int(w * 0.75)
-        scan_start = int(h * 0.80)
-        scan_floor = int(h * 0.05)
+        scan_top    = int(h * 0.05)
+        scan_bottom = int(h * 0.80)
 
+    # Determine which side of the beer line the G bottom sits on, then scan
+    # in the direction that will cross the boundary.
+    g_bottom_v = float(np.mean(value_ch[
+        min(g_bottom, h - 1),
+        scan_x1:scan_x2
+    ])) if g_bbox else 50.0
+
+    SUSTAIN = 12
     best_row = None
 
-    # Walk upward (decreasing y) from stout into foam.
-    # Use mean brightness (V channel): stout is always dark (<70), foam is
-    # bright (>100) whether white or iridescent/coloured.
-    # Require SUSTAIN_ROWS consecutive bright rows so text like "ESTD 1759"
-    # doesn't trigger a false crossing.
-    SUSTAIN_ROWS = 12
-    bright_streak = 0
-    crossing_bottom = None
-
-    for y in range(scan_start, scan_floor, -1):
-        mean_v = float(np.mean(value_ch[y, scan_x1:scan_x2]))
-        if mean_v > 100:
-            if bright_streak == 0:
-                crossing_bottom = y
-            bright_streak += 1
-            if bright_streak >= SUSTAIN_ROWS:
-                best_row = min(crossing_bottom + 4, scan_start)
-                break
-        else:
-            bright_streak = 0
-            crossing_bottom = None
-
-    # Fallback: lowest row that is clearly stout
-    if best_row is None:
-        for y in range(scan_start, scan_floor, -1):
-            mean_v = float(np.mean(value_ch[y, scan_x1:scan_x2]))
-            if mean_v < 60:
-                best_row = y
-                break
+    if g_bottom_v < 80:
+        # G bottom is in stout — scan UPWARD from g_bottom to find foam above.
+        start = min(h - 1, scan_bottom)
+        bright_streak, crossing_bottom = 0, None
+        for y in range(start, scan_top - 1, -1):
+            mv = float(np.mean(value_ch[y, scan_x1:scan_x2]))
+            if mv > 100:
+                if bright_streak == 0:
+                    crossing_bottom = y
+                bright_streak += 1
+                if bright_streak >= SUSTAIN:
+                    best_row = min(crossing_bottom + 4, start)
+                    break
+            else:
+                bright_streak, crossing_bottom = 0, None
+    else:
+        # G bottom is in foam — scan DOWNWARD from g_bottom to find stout below.
+        start = max(0, scan_top)
+        dark_streak, crossing_top = 0, None
+        for y in range(start, scan_bottom + 1):
+            mv = float(np.mean(value_ch[y, scan_x1:scan_x2]))
+            if mv < 70:
+                if dark_streak == 0:
+                    crossing_top = y
+                dark_streak += 1
+                if dark_streak >= SUSTAIN:
+                    best_row = max(crossing_top - 4, start)
+                    break
+            else:
+                dark_streak, crossing_top = 0, None
 
     if best_row is None:
         return None, None, None
