@@ -652,16 +652,16 @@ def detect_beer_line(img, roi=None, g_bbox=None):
         g_top    = g_bbox["y"]
         g_bottom = g_bbox["y"] + g_bbox["h"]
         g_h      = g_bbox["h"]
+        # Scan x: from g_left to g_right + one G-width to the right.
+        # Do NOT extend left of g_left — at the foam level the glass narrows,
+        # and any x < g_left may be outside the glass wall (bright background).
         pad      = g_bbox["w"]
-
-        # Scan the G column (± one G-width). The glass is transparent here so
-        # foam/stout show through clearly. Avoids the harp (glass centre).
-        # We intentionally include the GUINNESS text rows — white letters raise
-        # V slightly but the stout (V≈10) vs foam (V>150) gap is wide enough.
-        scan_x1 = max(0, g_left - pad)
+        scan_x1 = g_left
         scan_x2 = min(w, g_right + pad)
 
-        scan_top    = max(0,     g_top    - g_h)
+        # Top of scan: 5% from top of frame — always above the foam.
+        # Bottom of scan: two G-heights below the G box.
+        scan_top    = int(h * 0.05)
         scan_bottom = min(h - 1, g_bottom + g_h * 2)
     else:
         scan_x1, scan_x2 = int(w * 0.25), int(w * 0.75)
@@ -677,7 +677,15 @@ def detect_beer_line(img, roi=None, g_bbox=None):
 
     if g_bottom_v < 80:
         # G bottom is in stout — scan UPWARD from g_bottom to find foam above.
-        start = min(h - 1, scan_bottom)
+        # First, skip any bright glass-foot / coaster region below the stout by
+        # advancing the start upward to the first clearly-dark (stout) row.
+        raw_start = min(h - 1, scan_bottom)
+        start = raw_start
+        for y in range(raw_start, g_bottom - 1, -1):
+            if float(np.mean(value_ch[y, scan_x1:scan_x2])) < 80:
+                start = y
+                break
+
         bright_streak, crossing_bottom = 0, None
         for y in range(start, scan_top - 1, -1):
             mv = float(np.mean(value_ch[y, scan_x1:scan_x2]))
@@ -782,35 +790,28 @@ def _enhance_for_ocr(crop_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
 
-_g_template_cache: Optional[np.ndarray] = None
+_g_template_cache: list = []
 
-def _get_g_template() -> Optional[np.ndarray]:
+TEMPLATE_PATH2 = os.path.join(os.path.dirname(__file__), "assets", "g_template2.png")
+
+def _get_g_templates() -> list:
     global _g_template_cache
-    if _g_template_cache is None:
-        tmpl = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
-        if tmpl is not None:
-            _g_template_cache = tmpl
+    if not _g_template_cache:
+        for path in [TEMPLATE_PATH, TEMPLATE_PATH2]:
+            tmpl = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if tmpl is not None:
+                _g_template_cache.append(tmpl)
     return _g_template_cache
 
 
-def _template_match_g(image_bgr: np.ndarray) -> Optional[dict]:
-    """Primary G detection via multi-scale template matching."""
-    tmpl = _get_g_template()
-    if tmpl is None:
-        return None
-
-    h, w = image_bgr.shape[:2]
+def _try_one_template(tmpl: np.ndarray, crop_gray: np.ndarray,
+                      value_ch: np.ndarray, search_top: int, h: int
+                      ) -> tuple:
+    """Return (best_val, box_dict) for a single template, or (score, None) on rejection."""
     th, tw = tmpl.shape[:2]
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    value_ch = hsv[:, :, 2]
+    best_val, best_loc, best_size = -1.0, None, None
 
-    search_top = int(h * 0.25)
-    search_bot = int(h * 0.80)
-    crop_gray = cv2.cvtColor(image_bgr[search_top:search_bot, :], cv2.COLOR_BGR2GRAY)
-
-    best_val, best_loc, best_size = -1, None, None
-
-    for scale in np.linspace(0.2, 2.5, 50):
+    for scale in np.linspace(0.1, 3.0, 60):
         rw = max(1, int(tw * scale))
         rh = max(1, int(th * scale))
         if rw >= crop_gray.shape[1] or rh >= crop_gray.shape[0]:
@@ -822,31 +823,51 @@ def _template_match_g(image_bgr: np.ndarray) -> Optional[dict]:
             best_val, best_loc, best_size = max_val, max_loc, (rw, rh)
 
     if best_val < 0.55 or best_loc is None:
-        print(f"Template match score too low: {best_val:.3f}")
-        return None
+        return best_val, None
 
     x, y = best_loc
     rw, rh = best_size
     abs_y = y + search_top
     abs_bottom = abs_y + rh
 
-    # Sanity check: the GUINNESS label always has dark stout or a stout/foam
-    # transition somewhere near the G. If the region starting 20px below the
-    # matched box is bright (V > 120), this is a false positive (e.g. foam rim).
+    # Reject if the region below the match is bright (foam/rim false positive)
     check_y1 = min(h - 1, abs_bottom + 10)
     check_y2 = min(h - 1, abs_bottom + rh)
     if check_y2 > check_y1:
         below_v = float(np.mean(value_ch[check_y1:check_y2, x:x + rw]))
         if below_v > 120:
-            print(f"Template match rejected (below_v={below_v:.1f} too bright, likely foam): score={best_val:.3f}")
-            return None
+            print(f"  Rejected (below_v={below_v:.1f}): score={best_val:.3f}")
+            return best_val, None
 
-    print(f"Template match: score={best_val:.3f} bbox=({x},{abs_y},{rw},{rh})")
+    return best_val, {"box_left": x, "box_top": abs_y,
+                      "box_right": x + rw, "box_bottom": abs_bottom}
 
-    return {
-        "box_left": x, "box_top": abs_y,
-        "box_right": x + rw, "box_bottom": abs_bottom,
-    }
+
+def _template_match_g(image_bgr: np.ndarray) -> Optional[dict]:
+    """Primary G detection: try all templates, keep the highest-scoring valid hit."""
+    templates = _get_g_templates()
+    if not templates:
+        return None
+
+    h, w = image_bgr.shape[:2]
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    value_ch = hsv[:, :, 2]
+
+    # Wide search window — glass can be anywhere in frame
+    search_top = int(h * 0.10)
+    search_bot = int(h * 0.95)
+    crop_gray = cv2.cvtColor(image_bgr[search_top:search_bot, :], cv2.COLOR_BGR2GRAY)
+
+    best_val, best_box = -1.0, None
+    for i, tmpl in enumerate(templates):
+        val, box = _try_one_template(tmpl, crop_gray, value_ch, search_top, h)
+        print(f"Template {i+1}: score={val:.3f} {'✓' if box else '✗'}")
+        if box and val > best_val:
+            best_val, best_box = val, box
+
+    if best_box:
+        print(f"Best template match: score={best_val:.3f} bbox={best_box}")
+    return best_box
 
 
 def _ocr_fallback_g(image_bgr: np.ndarray) -> Optional[dict]:
