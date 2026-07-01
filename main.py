@@ -3,6 +3,7 @@ import os
 import sqlite3
 import secrets
 import smtplib
+import io
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -15,9 +16,18 @@ import bcrypt
 import jwt
 import numpy as np
 import cv2
-import easyocr  
+import easyocr
 from typing import Optional
 from difflib import SequenceMatcher
+import cloudinary
+import cloudinary.uploader
+
+cloudinary.config(
+    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.environ.get("CLOUDINARY_API_KEY"),
+    api_secret=os.environ.get("CLOUDINARY_API_SECRET"),
+    secure=True,
+)
 app = FastAPI()
 reader = easyocr.Reader(['en'], gpu=False)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -84,6 +94,7 @@ def init_db():
         "ALTER TABLE users ADD COLUMN photo_url TEXT",
         "ALTER TABLE users ADD COLUMN reset_token TEXT",
         "ALTER TABLE users ADD COLUMN reset_token_expires TEXT",
+        "ALTER TABLE scores ADD COLUMN cloudinary_url TEXT",
     ]:
         try:
             c.execute(col)
@@ -965,6 +976,19 @@ def detect_guinness_g(image_bgr: np.ndarray, glass_col: Optional[dict] = None) -
         print(f"detect_guinness_g failed: {e}")
         return None
 
+def _upload_to_cloudinary(img_bytes: bytes, folder: str = "splittheg") -> Optional[str]:
+    try:
+        result = cloudinary.uploader.upload(
+            io.BytesIO(img_bytes),
+            folder=folder,
+            resource_type="image",
+        )
+        return result.get("secure_url")
+    except Exception as e:
+        print(f"Cloudinary upload failed: {e}")
+        return None
+
+
 # ── IMAGE ANALYSIS ENDPOINT ───────────────────────────────────────────────────
 
 
@@ -1036,6 +1060,11 @@ async def analyze(file: UploadFile = File(...)):
     beer_line_position = get_beer_line_position(beer_line_pct, g_midpoint_pct)
     description = build_description(distance_cm, beer_line_position, True)
 
+    # Upload to Cloudinary for training data collection (non-blocking best-effort)
+    cloudinary_url = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: _upload_to_cloudinary(img_bytes)
+    )
+
     return {
     "glass_detected": True,
     "beer_present": True,
@@ -1049,6 +1078,7 @@ async def analyze(file: UploadFile = File(...)):
     "g_detection": g_result,
     "image_width": w,
     "image_height": h,
+    "cloudinary_url": cloudinary_url,
     # ── overlay data for the app ──
     "overlay": {
         "guinness_box": {
