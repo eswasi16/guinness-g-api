@@ -801,6 +801,8 @@ def _template_match_g(image_bgr: np.ndarray) -> Optional[dict]:
 
     h, w = image_bgr.shape[:2]
     th, tw = tmpl.shape[:2]
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    value_ch = hsv[:, :, 2]
 
     search_top = int(h * 0.25)
     search_bot = int(h * 0.80)
@@ -826,11 +828,24 @@ def _template_match_g(image_bgr: np.ndarray) -> Optional[dict]:
     x, y = best_loc
     rw, rh = best_size
     abs_y = y + search_top
+    abs_bottom = abs_y + rh
+
+    # Sanity check: the GUINNESS label always has dark stout or a stout/foam
+    # transition somewhere near the G. If the region starting 20px below the
+    # matched box is bright (V > 120), this is a false positive (e.g. foam rim).
+    check_y1 = min(h - 1, abs_bottom + 10)
+    check_y2 = min(h - 1, abs_bottom + rh)
+    if check_y2 > check_y1:
+        below_v = float(np.mean(value_ch[check_y1:check_y2, x:x + rw]))
+        if below_v > 120:
+            print(f"Template match rejected (below_v={below_v:.1f} too bright, likely foam): score={best_val:.3f}")
+            return None
+
     print(f"Template match: score={best_val:.3f} bbox=({x},{abs_y},{rw},{rh})")
 
     return {
         "box_left": x, "box_top": abs_y,
-        "box_right": x + rw, "box_bottom": abs_y + rh,
+        "box_right": x + rw, "box_bottom": abs_bottom,
     }
 
 
