@@ -619,6 +619,38 @@ async def unfollow(body: dict):
 # ── IMAGE ANALYSIS HELPERS ────────────────────────────────────────────────────
 
 
+def detect_glass_column(image_bgr: np.ndarray) -> Optional[dict]:
+    """Locate the glass body by finding the largest contiguous dark (stout) region."""
+    h, w = image_bgr.shape[:2]
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    value_ch = hsv[:, :, 2]
+
+    stout_mask = np.where(value_ch < 50, np.uint8(255), np.uint8(0))
+
+    # Close gaps from GUINNESS text, reflections, and label graphics
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
+    stout_mask = cv2.morphologyEx(stout_mask, cv2.MORPH_CLOSE, kernel)
+
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(stout_mask, connectivity=8)
+    if n_labels < 2:
+        return None
+
+    # Largest component (skip label 0 = background)
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest = int(np.argmax(areas)) + 1
+    x  = int(stats[largest, cv2.CC_STAT_LEFT])
+    y  = int(stats[largest, cv2.CC_STAT_TOP])
+    cw = int(stats[largest, cv2.CC_STAT_WIDTH])
+    ch = int(stats[largest, cv2.CC_STAT_HEIGHT])
+
+    # Must be a plausible glass body (tall, not tiny)
+    if ch < h * 0.15 or cw < w * 0.05:
+        return None
+
+    print(f"Glass column: x={x} y={y} w={cw} h={ch}")
+    return {"x": x, "y": y, "w": cw, "h": ch, "x2": x + cw, "y2": y + ch}
+
+
 def find_glass_roi(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -652,10 +684,8 @@ def detect_beer_line(img, roi=None, g_bbox=None):
         g_top    = g_bbox["y"]
         g_bottom = g_bbox["y"] + g_bbox["h"]
         g_h      = g_bbox["h"]
-        # Scan x: from g_left to g_right + one G-width to the right.
-        # Do NOT extend left of g_left — at the foam level the glass narrows,
-        # and any x < g_left may be outside the glass wall (bright background).
-        pad      = g_bbox["w"]
+
+        pad = g_bbox["w"]
         scan_x1 = g_left
         scan_x2 = min(w, g_right + pad)
 
@@ -805,8 +835,8 @@ def _get_g_templates() -> list:
 
 
 def _try_one_template(tmpl: np.ndarray, crop_gray: np.ndarray,
-                      value_ch: np.ndarray, search_top: int, h: int
-                      ) -> tuple:
+                      value_ch: np.ndarray, search_top: int, h: int,
+                      x_offset: int = 0) -> tuple:
     """Return (best_val, box_dict) for a single template, or (score, None) on rejection."""
     th, tw = tmpl.shape[:2]
     best_val, best_loc, best_size = -1.0, None, None
@@ -827,6 +857,7 @@ def _try_one_template(tmpl: np.ndarray, crop_gray: np.ndarray,
 
     x, y = best_loc
     rw, rh = best_size
+    abs_x = x + x_offset
     abs_y = y + search_top
     abs_bottom = abs_y + rh
 
@@ -834,16 +865,16 @@ def _try_one_template(tmpl: np.ndarray, crop_gray: np.ndarray,
     check_y1 = min(h - 1, abs_bottom + 10)
     check_y2 = min(h - 1, abs_bottom + rh)
     if check_y2 > check_y1:
-        below_v = float(np.mean(value_ch[check_y1:check_y2, x:x + rw]))
+        below_v = float(np.mean(value_ch[check_y1:check_y2, abs_x:abs_x + rw]))
         if below_v > 120:
             print(f"  Rejected (below_v={below_v:.1f}): score={best_val:.3f}")
             return best_val, None
 
-    return best_val, {"box_left": x, "box_top": abs_y,
-                      "box_right": x + rw, "box_bottom": abs_bottom}
+    return best_val, {"box_left": abs_x, "box_top": abs_y,
+                      "box_right": abs_x + rw, "box_bottom": abs_bottom}
 
 
-def _template_match_g(image_bgr: np.ndarray) -> Optional[dict]:
+def _template_match_g(image_bgr: np.ndarray, glass_col: Optional[dict] = None) -> Optional[dict]:
     """Primary G detection: try all templates, keep the highest-scoring valid hit."""
     templates = _get_g_templates()
     if not templates:
@@ -853,14 +884,16 @@ def _template_match_g(image_bgr: np.ndarray) -> Optional[dict]:
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     value_ch = hsv[:, :, 2]
 
-    # Wide search window — glass can be anywhere in frame
     search_top = int(h * 0.10)
     search_bot = int(h * 0.95)
-    crop_gray = cv2.cvtColor(image_bgr[search_top:search_bot, :], cv2.COLOR_BGR2GRAY)
+    # Constrain x to the glass column when available — eliminates background false positives
+    x1 = glass_col["x"] if glass_col else 0
+    x2 = glass_col["x2"] if glass_col else w
+    crop_gray = cv2.cvtColor(image_bgr[search_top:search_bot, x1:x2], cv2.COLOR_BGR2GRAY)
 
     best_val, best_box = -1.0, None
     for i, tmpl in enumerate(templates):
-        val, box = _try_one_template(tmpl, crop_gray, value_ch, search_top, h)
+        val, box = _try_one_template(tmpl, crop_gray, value_ch, search_top, h, x_offset=x1)
         print(f"Template {i+1}: score={val:.3f} {'✓' if box else '✗'}")
         if box and val > best_val:
             best_val, best_box = val, box
@@ -903,11 +936,11 @@ def _ocr_fallback_g(image_bgr: np.ndarray) -> Optional[dict]:
     return None
 
 
-def detect_guinness_g(image_bgr: np.ndarray) -> Optional[dict]:
+def detect_guinness_g(image_bgr: np.ndarray, glass_col: Optional[dict] = None) -> Optional[dict]:
     h, w = image_bgr.shape[:2]
 
     try:
-        box = _template_match_g(image_bgr)
+        box = _template_match_g(image_bgr, glass_col=glass_col)
         if box is None:
             box = _ocr_fallback_g(image_bgr)
         if box is None:
@@ -971,8 +1004,11 @@ async def analyze(file: UploadFile = File(...)):
                 "measurement_method": "opencv", "g_detection": None,
                 "image_width": w, "image_height": h}
 
+    # ── Detect glass column (constrains all subsequent searches to the glass body) ──
+    glass_col = detect_glass_column(img)
+
     # ── Detect G ──
-    g_result = detect_guinness_g(img)
+    g_result = detect_guinness_g(img, glass_col=glass_col)
 
     if g_result is None:
         return {"glass_detected": True, "beer_present": True, "g_detected": False,
