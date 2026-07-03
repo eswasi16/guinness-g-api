@@ -774,6 +774,12 @@ def calculate_distance_cm(beer_line_pct, g_midpoint_pct):
     return round((diff_pct / 100) * GLASS_HEIGHT_CM, 2)
 
 
+def calculate_score(beer_line_pct, g_midpoint_pct):
+    """0–100 score. 100 = beer line at G center, 0 = beer line at top/bottom of glass."""
+    diff_pct = abs(beer_line_pct - g_midpoint_pct)
+    return max(0, round(100 - (diff_pct / 50) * 100))
+
+
 def get_beer_line_position(beer_line_pct, g_midpoint_pct):
     if abs(beer_line_pct - g_midpoint_pct) < 1.0:
         return "at_g"
@@ -783,20 +789,20 @@ def get_beer_line_position(beer_line_pct, g_midpoint_pct):
         return "below_g"
 
 
-def build_description(distance_cm, beer_line_position, g_detected):
+def build_description(score, beer_line_position, g_detected):
     if not g_detected:
         return "G logo not clearly detected — show the Guinness label for best results."
-    if distance_cm == 0:
-        return "Perfect split! The beer line bisects the G logo perfectly."
     pos = beer_line_position.replace("_", " ")
-    if distance_cm <= 0.3:
-        return f"Nearly perfect — the beer line is just {distance_cm}cm {pos}."
-    elif distance_cm <= 1.0:
-        return f"Good pour — {distance_cm}cm off, beer line is {pos}."
-    elif distance_cm <= 2.5:
-        return f"Not bad — {distance_cm}cm off, beer line is {pos}. Keep practicing!"
+    if score == 100:
+        return "Perfect split! The beer line bisects the G perfectly."
+    elif score >= 90:
+        return f"{score}/100 — nearly perfect, beer line is {pos}!"
+    elif score >= 75:
+        return f"{score}/100 — good pour, beer line is {pos}."
+    elif score >= 50:
+        return f"{score}/100 — not bad, beer line is {pos}. Keep practicing!"
     else:
-        return f"Needs work — {distance_cm}cm off, beer line is {pos}."
+        return f"{score}/100 — needs work, beer line is {pos}."
 
 # ── G Template Matching ───────────────────────────────────────────────────────
 TEMPLATE_PATH = "assets/g_template.png"
@@ -1090,8 +1096,9 @@ async def analyze(file: UploadFile = File(...)):
     g_midpoint_pct = (1 - g_center_y / h) * 100
 
     distance_cm = calculate_distance_cm(beer_line_pct, g_midpoint_pct)
+    score = calculate_score(beer_line_pct, g_midpoint_pct)
     beer_line_position = get_beer_line_position(beer_line_pct, g_midpoint_pct)
-    description = build_description(distance_cm, beer_line_position, True)
+    description = build_description(score, beer_line_position, True)
 
     # Upload to Cloudinary for training data collection (non-blocking best-effort)
     cloudinary_url = await asyncio.get_event_loop().run_in_executor(
@@ -1102,6 +1109,7 @@ async def analyze(file: UploadFile = File(...)):
     "glass_detected": True,
     "beer_present": True,
     "g_detected": True,
+    "score": score,
     "distance_cm": round(distance_cm, 2),
     "description": description,
     "beer_line_position": beer_line_position,
