@@ -914,14 +914,22 @@ def _template_match_g(image_bgr: np.ndarray, glass_col: Optional[dict] = None) -
     return best_box
 
 
-def _ocr_fallback_g(image_bgr: np.ndarray) -> Optional[dict]:
-    """Fallback G detection via EasyOCR fuzzy word match."""
+def _ocr_fallback_g(image_bgr: np.ndarray) -> tuple:
+    """Fallback G detection via EasyOCR fuzzy word match.
+    Returns (box_or_None, saw_guinness_text) so callers can distinguish
+    'no Guinness in frame' from 'Guinness present but G unclear'.
+    """
     h, w = image_bgr.shape[:2]
-    search_top = int(h * 0.30)
-    search_bot = int(h * 0.75)
+    search_top = int(h * 0.10)   # wider band than before — catches labels anywhere
+    search_bot = int(h * 0.90)
     crop = _enhance_for_ocr(image_bgr[search_top:search_bot, :])
     results = reader.readtext(crop)
     print(f"EasyOCR fallback: {[(text, round(conf,2)) for _, text, conf in results]}")
+
+    saw_guinness = any(
+        conf > 0.1 and _looks_like_guinness(text)
+        for (_, text, conf) in results
+    )
 
     for (bbox, text, conf) in results:
         if text.strip().upper() == 'G' and conf > 0.2:
@@ -930,7 +938,7 @@ def _ocr_fallback_g(image_bgr: np.ndarray) -> Optional[dict]:
             max_x = int(max(p[0] for p in pts))
             min_y = int(min(p[1] for p in pts)) + search_top
             max_y = int(max(p[1] for p in pts)) + search_top
-            return {"box_left": min_x, "box_top": min_y, "box_right": max_x, "box_bottom": max_y}
+            return {"box_left": min_x, "box_top": min_y, "box_right": max_x, "box_bottom": max_y}, True
 
     for (bbox, text, conf) in results:
         if conf > 0.1 and _looks_like_guinness(text):
@@ -942,20 +950,28 @@ def _ocr_fallback_g(image_bgr: np.ndarray) -> Optional[dict]:
             max_y = int(max(p[1] for p in pts)) + search_top
             word_width = max_x - min_x
             char_width = max(1, int(word_width / max(len(clean), 1) * 1.3))
-            return {"box_left": min_x, "box_top": min_y, "box_right": min_x + char_width, "box_bottom": max_y}
+            return {"box_left": min_x, "box_top": min_y, "box_right": min_x + char_width, "box_bottom": max_y}, True
 
-    return None
+    return None, saw_guinness
 
 
-def detect_guinness_g(image_bgr: np.ndarray, glass_col: Optional[dict] = None) -> Optional[dict]:
+def detect_guinness_g(image_bgr: np.ndarray, glass_col: Optional[dict] = None) -> tuple:
+    """Returns (result_or_None, saw_guinness_label).
+    saw_guinness_label is True if GUINNESS text was found anywhere in the image,
+    even when the G bounding box couldn't be isolated.
+    """
     h, w = image_bgr.shape[:2]
 
     try:
         box = _template_match_g(image_bgr, glass_col=glass_col)
+        if box is not None:
+            # Template matched — definitely a Guinness
+            saw_guinness = True
+        else:
+            box, saw_guinness = _ocr_fallback_g(image_bgr)
+
         if box is None:
-            box = _ocr_fallback_g(image_bgr)
-        if box is None:
-            return None
+            return None, saw_guinness
 
         box_left   = box["box_left"]
         box_right  = box["box_right"]
@@ -970,11 +986,11 @@ def detect_guinness_g(image_bgr: np.ndarray, glass_col: Optional[dict] = None) -
             "center": {"x": g_center_x, "y": g_center_y},
             "beer_line_y": g_center_y,
             "confidence": 1.0,
-        }
+        }, True
 
     except Exception as e:
         print(f"detect_guinness_g failed: {e}")
-        return None
+        return None, False
 
 def _upload_to_cloudinary(img_bytes: bytes, folder: str = "splittheg") -> Optional[str]:
     try:
@@ -1032,11 +1048,15 @@ async def analyze(file: UploadFile = File(...)):
     glass_col = detect_glass_column(img)
 
     # ── Detect G ──
-    g_result = detect_guinness_g(img, glass_col=glass_col)
+    g_result, saw_guinness = detect_guinness_g(img, glass_col=glass_col)
 
     if g_result is None:
+        if not saw_guinness:
+            desc = "No Guinness detected. Point the camera at a Guinness pint showing the GUINNESS label and try again."
+        else:
+            desc = "G logo not detected. Try better lighting, hold the phone steady, and make sure the label is visible."
         return {"glass_detected": True, "beer_present": True, "g_detected": False,
-                "distance_cm": None, "description": "G logo not detected. Try better lighting or a closer angle.",
+                "distance_cm": None, "description": desc,
                 "beer_line_position": None, "g_midpoint_pct": None, "beer_line_pct": None,
                 "measurement_method": "opencv", "g_detection": None,
                 "image_width": w, "image_height": h}
@@ -1151,7 +1171,7 @@ async def debug_image(file: UploadFile = File(...)):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
     # ── G detection + beer line ──
-    g_result = await asyncio.get_event_loop().run_in_executor(
+    g_result, _ = await asyncio.get_event_loop().run_in_executor(
         None, lambda: detect_guinness_g(img)
     )
 
