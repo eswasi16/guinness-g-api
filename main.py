@@ -684,7 +684,7 @@ def find_glass_roi(img):
     return best
 
 
-def detect_beer_line(img, roi=None, g_bbox=None):
+def detect_beer_line(img, roi=None, g_bbox=None, word_bbox=None):
     h, w = img.shape[:2]
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     value_ch = hsv[:, :, 2]  # V channel: stout dark (~10-50), foam bright (>100) for any foam colour
@@ -696,9 +696,16 @@ def detect_beer_line(img, roi=None, g_bbox=None):
         g_bottom = g_bbox["y"] + g_bbox["h"]
         g_h      = g_bbox["h"]
 
-        pad = g_bbox["w"]
-        scan_x1 = g_left
-        scan_x2 = min(w, g_right + pad)
+        if word_bbox:
+            # Use the full GUINNESS word x extent — tighter and more accurate
+            # than the g_bbox heuristic when OCR detected the word
+            scan_x1 = word_bbox["x"]
+            scan_x2 = min(w, word_bbox["x"] + word_bbox["w"])
+            print(f"Beer line scan x: word_bbox [{scan_x1}–{scan_x2}]")
+        else:
+            pad = g_bbox["w"]
+            scan_x1 = g_left
+            scan_x2 = min(w, g_right + pad)
 
         # Top of scan: 5% from top of frame — always above the foam.
         # Bottom of scan: two G-heights below the G box.
@@ -916,11 +923,12 @@ def _template_match_g(image_bgr: np.ndarray, glass_col: Optional[dict] = None) -
 
 def _ocr_fallback_g(image_bgr: np.ndarray) -> tuple:
     """Fallback G detection via EasyOCR fuzzy word match.
-    Returns (box_or_None, saw_guinness_text) so callers can distinguish
-    'no Guinness in frame' from 'Guinness present but G unclear'.
+    Returns (box_or_None, saw_guinness_text, word_bbox_or_None).
+    word_bbox is the full GUINNESS word bounding box — used to constrain
+    the beer line scan x range when the word is detected.
     """
     h, w = image_bgr.shape[:2]
-    search_top = int(h * 0.10)   # wider band than before — catches labels anywhere
+    search_top = int(h * 0.10)
     search_bot = int(h * 0.90)
     crop = _enhance_for_ocr(image_bgr[search_top:search_bot, :])
     results = reader.readtext(crop)
@@ -938,7 +946,8 @@ def _ocr_fallback_g(image_bgr: np.ndarray) -> tuple:
             max_x = int(max(p[0] for p in pts))
             min_y = int(min(p[1] for p in pts)) + search_top
             max_y = int(max(p[1] for p in pts)) + search_top
-            return {"box_left": min_x, "box_top": min_y, "box_right": max_x, "box_bottom": max_y}, True
+            return ({"box_left": min_x, "box_top": min_y, "box_right": max_x, "box_bottom": max_y},
+                    True, None)
 
     for (bbox, text, conf) in results:
         if conf > 0.1 and _looks_like_guinness(text):
@@ -948,11 +957,13 @@ def _ocr_fallback_g(image_bgr: np.ndarray) -> tuple:
             max_x = int(max(p[0] for p in pts))
             min_y = int(min(p[1] for p in pts)) + search_top
             max_y = int(max(p[1] for p in pts)) + search_top
+            word_bbox = {"x": min_x, "y": min_y, "w": max_x - min_x, "h": max_y - min_y}
             word_width = max_x - min_x
             char_width = max(1, int(word_width / max(len(clean), 1) * 1.3))
-            return {"box_left": min_x, "box_top": min_y, "box_right": min_x + char_width, "box_bottom": max_y}, True
+            return ({"box_left": min_x, "box_top": min_y, "box_right": min_x + char_width, "box_bottom": max_y},
+                    True, word_bbox)
 
-    return None, saw_guinness
+    return None, saw_guinness, None
 
 
 def detect_guinness_g(image_bgr: np.ndarray, glass_col: Optional[dict] = None) -> tuple:
@@ -965,10 +976,10 @@ def detect_guinness_g(image_bgr: np.ndarray, glass_col: Optional[dict] = None) -
     try:
         box = _template_match_g(image_bgr, glass_col=glass_col)
         if box is not None:
-            # Template matched — definitely a Guinness
             saw_guinness = True
+            word_bbox = None  # template match doesn't give us a word bbox
         else:
-            box, saw_guinness = _ocr_fallback_g(image_bgr)
+            box, saw_guinness, word_bbox = _ocr_fallback_g(image_bgr)
 
         if box is None:
             return None, saw_guinness
@@ -986,6 +997,7 @@ def detect_guinness_g(image_bgr: np.ndarray, glass_col: Optional[dict] = None) -
             "center": {"x": g_center_x, "y": g_center_y},
             "beer_line_y": g_center_y,
             "confidence": 1.0,
+            "word_bbox": word_bbox,
         }, True
 
     except Exception as e:
@@ -1063,7 +1075,8 @@ async def analyze(file: UploadFile = File(...)):
 
     # ── Detect beer line ──
     g_bbox = g_result["bbox"]
-    _, beer_row, _ = detect_beer_line(img, g_bbox=g_bbox)
+    word_bbox = g_result.get("word_bbox")
+    _, beer_row, _ = detect_beer_line(img, g_bbox=g_bbox, word_bbox=word_bbox)
     if beer_row is None:
         return {"glass_detected": True, "beer_present": True, "g_detected": False,
                 "distance_cm": None, "description": "Could not detect beer line. Try a closer angle.",
