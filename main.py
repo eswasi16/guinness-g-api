@@ -21,6 +21,9 @@ from typing import Optional
 from difflib import SequenceMatcher
 import cloudinary
 import cloudinary.uploader
+from openai import OpenAI
+
+_openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY")) if os.environ.get("OPENAI_API_KEY") else None
 
 cloudinary.config(
     cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME"),
@@ -627,6 +630,47 @@ async def unfollow(body: dict):
     return {"status": "unfollowed"}
 
 
+# ── OPENAI VALIDATION ────────────────────────────────────────────────────────
+
+
+def _validate_guinness_openai(img_bytes: bytes) -> tuple:
+    """Use GPT-4o-mini to check if the image is a Guinness pint with beer.
+    Returns (is_valid: bool, reason: str).
+    Falls back to (True, 'skipped') if OpenAI is not configured.
+    """
+    if _openai_client is None:
+        return True, "skipped"
+    try:
+        b64 = __import__("base64").b64encode(img_bytes).decode()
+        response = _openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=50,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"},
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Does this image show a Guinness pint glass containing beer or stout? "
+                            "Answer with only YES or NO, then one short reason."
+                        ),
+                    },
+                ],
+            }],
+        )
+        answer = response.choices[0].message.content.strip()
+        print(f"OpenAI validation: {answer}")
+        is_valid = answer.upper().startswith("YES")
+        return is_valid, answer
+    except Exception as e:
+        print(f"OpenAI validation failed: {e}")
+        return True, "error"  # fail open so a real Guinness is never rejected due to API issues
+
+
 # ── IMAGE ANALYSIS HELPERS ────────────────────────────────────────────────────
 
 
@@ -1040,26 +1084,17 @@ async def analyze(file: UploadFile = File(...)):
                 "image_width": None, "image_height": None}
 
     h, w = img.shape[:2]
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 75))
-    cream_mask = cv2.inRange(hsv, (15, 10, 160), (45, 130, 255))
-    dark_ratio = np.sum(dark_mask > 0) / (h * w)
-    cream_ratio = np.sum(cream_mask > 0) / (h * w)
-    glass_detected = dark_ratio > 0.04
-    beer_present = dark_ratio > 0.06 and cream_ratio > 0.008
 
-    if not glass_detected:
+    # ── OpenAI validation: confirm this is a Guinness pint before doing any analysis ──
+    is_guinness, ai_reason = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: _validate_guinness_openai(img_bytes)
+    )
+    if not is_guinness:
         return {"glass_detected": False, "beer_present": False, "g_detected": False,
-                "distance_cm": None, "description": "No Guinness glass detected. Make sure the glass fills most of the frame.",
-                "beer_line_position": None, "g_midpoint_pct": 35, "beer_line_pct": 50,
-                "measurement_method": "opencv", "g_detection": None,
-                "image_width": w, "image_height": h}
-
-    if not beer_present:
-        return {"glass_detected": True, "beer_present": False, "g_detected": False,
-                "distance_cm": None, "description": "Glass detected but no beer visible. Is it empty?",
-                "beer_line_position": None, "g_midpoint_pct": 35, "beer_line_pct": 50,
-                "measurement_method": "opencv", "g_detection": None,
+                "distance_cm": None, "score": None,
+                "description": "That doesn't look like a Guinness pint. Point the camera at a Guinness glass showing the label and try again.",
+                "beer_line_position": None, "g_midpoint_pct": None, "beer_line_pct": None,
+                "measurement_method": "openai-validation", "g_detection": None,
                 "image_width": w, "image_height": h}
 
     # ── Detect glass column (constrains all subsequent searches to the glass body) ──
