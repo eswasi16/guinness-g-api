@@ -655,7 +655,10 @@ def _validate_guinness_openai(img_bytes: bytes) -> tuple:
                     {
                         "type": "text",
                         "text": (
-                            "Does this image show a Guinness pint glass containing beer or stout? "
+                            "Does this image show a Guinness pint glass containing beer or stout "
+                            "with the word GUINNESS visible on the glass or label? "
+                            "Both conditions must be true: (1) it must be a Guinness pint glass with dark stout, "
+                            "and (2) the GUINNESS branding/text must be visible. "
                             "Answer with only YES or NO, then one short reason."
                         ),
                     },
